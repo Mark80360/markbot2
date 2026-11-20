@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "markbot"
+version = "0.1.0"
+description = "MarkBot2: 1+N personal assistant agent with permissioned extensions and a self-improving learning layer"
+readme = "README.md"
+requires-python = ">=3.12"
+license = "Apache-2.0"
+authors = [{ name = "MarkBot" }]
+dependencies = [
+  "pydantic>=2.7,<3",
+  "httpx>=0.27,<1",
+  "PyYAML>=6,<7",
+]
+
+[project.optional-dependencies]
+office = ["openpyxl>=3.1,<4"]
+channels = ["lark-oapi>=1.8,<2"]
+cron = ["croniter>=2,<7"]
+dev = ["pytest>=8", "ruff>=0.5"]
+
+[project.scripts]
+markbot = "markbot.cli.main:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["markbot*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+pythonpath = ["src"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+src = ["src"]
+extend-exclude = ["capabilities", "evals"]
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I"]

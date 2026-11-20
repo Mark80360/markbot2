@@ -1,0 +1,13 @@
+[package]
+name = "cron"
+version = "0.1.0"
+description = "定时任务能力包：cron 工具与使用技能"
+license = "MIT"
+priority = 90
+
+[permissions]
+capabilities = []
+
+[resources]
+extensions = ["./extensions"]
+skills = ["./skills"]

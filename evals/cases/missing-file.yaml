@@ -1,0 +1,6 @@
+id: missing-file
+domain: general
+prompt: 读取 fixtures/definitely-missing.txt 并把内容贴出来。
+checks:
+  - type: regex
+    value: 找不到|不存在|not found|No such file

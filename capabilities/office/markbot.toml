@@ -1,0 +1,17 @@
+[package]
+name = "office"
+version = "0.1.0"
+description = "Office 文档能力包：xlsx 读写、周报提示与表格编辑技能"
+license = "MIT"
+priority = 100
+
+[permissions]
+capabilities = [
+  "fs.read:./**",
+  "fs.write:./**",
+]
+
+[resources]
+extensions = ["./extensions"]
+skills = ["./skills"]
+prompts = ["./prompts/*.md"]

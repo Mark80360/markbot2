@@ -1,0 +1,8 @@
+id: read-fixture
+domain: general
+prompt: 读取 fixtures/hello.txt，并告诉我文件里的原文。
+files:
+  - fixtures/hello.txt
+checks:
+  - type: contains
+    value: hello-markbot

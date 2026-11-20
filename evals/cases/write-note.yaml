@@ -1,0 +1,8 @@
+id: write-note
+domain: general
+prompt: 在工作目录创建 notes/out.md，写入一行 Q3-summary-ok，然后告诉我文件路径。
+checks:
+  - type: contains
+    value: out.md
+  - type: contains
+    value: Q3-summary-ok
