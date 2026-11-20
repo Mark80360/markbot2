@@ -13,3 +13,4 @@ htmlcov/
 output/
 ${APPDATA}/
 .screenshots/
+docs/
