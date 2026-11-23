@@ -4,7 +4,13 @@ from __future__ import annotations
 
 from markbot.kernel.config import Config, resolve_provider_kind
 from markbot.kernel.providers.anthropic import AnthropicProvider
-from markbot.kernel.providers.base import ModelReply, Provider, ProviderError, ToolCall
+from markbot.kernel.providers.base import (
+    ContentRejectedError,
+    ModelReply,
+    Provider,
+    ProviderError,
+    ToolCall,
+)
 from markbot.kernel.providers.echo import EchoProvider, ScriptedProvider
 from markbot.kernel.providers.openai_compat import OpenAICompatProvider
 
@@ -58,6 +64,7 @@ def build_provider(cfg: Config, secrets: dict[str, str] | None = None) -> Provid
 
 __all__ = [
     "AnthropicProvider",
+    "ContentRejectedError",
     "EchoProvider",
     "ModelReply",
     "OpenAICompatProvider",

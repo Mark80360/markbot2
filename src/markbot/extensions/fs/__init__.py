@@ -1,4 +1,8 @@
-"""文件系统工具：读写、列目录、glob。"""
+"""文件系统工具：读写、列目录、glob。
+
+所有 I/O 都走 ``ctx.env``（``ExecutionEnvironment``），扩展不直接拼路径或读盘，
+这样换成容器/远程执行时无需改工具代码。
+"""
 
 from __future__ import annotations
 
@@ -12,35 +16,29 @@ MAX_READ_CHARS = 40_000
 
 
 def _resolve(ctx, raw: str) -> Path:
-    path = Path(raw).expanduser()
-    root = Path(ctx.policy.root).resolve()
-    resolved = (root / path).resolve() if not path.is_absolute() else path.resolve()
-    try:
-        resolved.relative_to(root)
-    except ValueError as exc:
-        raise PermissionError(f"路径越界: {raw}") from exc
-    return resolved
+    return ctx.env.resolve(raw)
 
 
 class ReadIn(BaseModel):
-    path: str = Field(description="文件路径（相对工作目录或绝对路径）")
+    path: str = Field(description="文件路径（相对工作目录或绝对路径）", json_schema_extra={"x-markbot-role": "path"})
     start_line: int = Field(default=1, ge=1, description="起始行号")
     max_lines: int = Field(default=400, ge=1, le=4000, description="最多读取行数")
 
 
 class WriteIn(BaseModel):
-    path: str = Field(description="目标文件路径")
+    path: str = Field(description="目标文件路径", json_schema_extra={"x-markbot-role": "path"})
     content: str = Field(description="完整文件内容")
     create_dirs: bool = Field(default=True, description="自动创建父目录")
 
 
 class ListIn(BaseModel):
-    path: str = Field(default=".", description="目录路径")
+    path: str = Field(default=".", description="目录路径", json_schema_extra={"x-markbot-role": "path"})
     limit: int = Field(default=200, ge=1, le=1000)
 
 
 class GlobIn(BaseModel):
-    pattern: str = Field(description="glob 模式，例如 **/*.py")
+    # glob 模式也按路径检查：``../*``、绝对路径越界会被拒绝
+    pattern: str = Field(description="glob 模式，例如 **/*.py", json_schema_extra={"x-markbot-role": "path"})
     limit: int = Field(default=200, ge=1, le=1000)
 
 
@@ -49,7 +47,7 @@ def setup(api: ExtensionAPI) -> None:
         path = _resolve(ctx, args.path)
         if not path.is_file():
             return ToolResult.error(f"不是文件: {args.path}")
-        text = path.read_text(encoding="utf-8", errors="replace")
+        text = ctx.env.read_text(args.path)
         lines = text.splitlines()
         start = args.start_line - 1
         chunk = lines[start : start + args.max_lines]
@@ -62,10 +60,7 @@ def setup(api: ExtensionAPI) -> None:
         )
 
     async def write_file(ctx, args: WriteIn) -> ToolResult:
-        path = _resolve(ctx, args.path)
-        if args.create_dirs:
-            path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(args.content, encoding="utf-8")
+        path = ctx.env.write_text(args.path, args.content, create_dirs=args.create_dirs)
         return ToolResult(
             content=f"已写入 {path}（{len(args.content)} 字符）",
             details={"path": str(path)},
@@ -76,23 +71,15 @@ def setup(api: ExtensionAPI) -> None:
         if not path.is_dir():
             return ToolResult.error(f"不是目录: {args.path}")
         entries = []
-        for child in sorted(path.iterdir())[: args.limit]:
+        for child in ctx.env.list_dir(args.path, limit=args.limit):
             kind = "dir" if child.is_dir() else "file"
             size = child.stat().st_size if child.is_file() else 0
             entries.append(f"{kind}\t{child.name}\t{size}")
         return ToolResult(content="\n".join(entries) or "（空目录）")
 
     async def glob_files(ctx, args: GlobIn) -> ToolResult:
-        root = Path(ctx.policy.root).resolve()
-        matches = []
-        for path in root.glob(args.pattern):
-            try:
-                matches.append(path.relative_to(root).as_posix())
-            except ValueError:
-                continue
-            if len(matches) >= args.limit:
-                break
-        return ToolResult(content="\n".join(sorted(matches)) or "（无匹配）")
+        matches = ctx.env.glob(args.pattern, limit=args.limit)
+        return ToolResult(content="\n".join(matches) or "（无匹配）")
 
     api.register_tool(
         Tool(

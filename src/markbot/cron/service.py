@@ -86,7 +86,7 @@ class CronService:
         on_job: CronCallback | None = None,
         default_delivery: str = "auto",
         default_timezone: str | None = None,
-        max_history: int = 20,
+        max_history: int = 3,
         max_delay_s: float = 60.0,
     ) -> None:
         self.store_path = Path(store_path)

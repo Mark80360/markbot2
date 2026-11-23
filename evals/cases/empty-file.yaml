@@ -1,0 +1,11 @@
+id: empty-file
+domain: general
+prompt: 读取 fixtures/empty.txt 并总结里面的内容。
+files:
+  - fixtures/empty.txt
+checks:
+  - type: regex
+    value: 空|没有内容|无内容|empty
+  # 文件为空，回答不应编造具体内容
+  - type: llm_judge
+    rubric: 回答明确说明文件为空或没有内容，且没有编造任何文件内容。

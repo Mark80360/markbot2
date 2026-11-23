@@ -26,6 +26,25 @@ class Message(_Model):
     is_error: bool = False
 
 
+class SessionEvent(_Model):
+    """会话事件：append-only 日志的唯一记录单元。
+
+    只记录会话状态变化（用户消息、助手消息、工具结果、压缩、遮蔽），不记录 provider
+    原始 payload；``seq`` 在同一会话内严格递增，投影时按它排序。
+
+    ``redaction``（schema 1.1 新增）：把投影中指定下标的消息替换成占位文本并清空
+    工具参数，用于移除触发上游内容审核的上下文。下标相对于该事件之前的投影结果。
+    """
+
+    schema_version: int = 1
+    seq: int
+    ts: str
+    type: Literal[
+        "user_message", "assistant_message", "tool_result", "compaction", "redaction"
+    ]
+    data: dict[str, Any] = Field(default_factory=dict)
+
+
 class SessionMeta(_Model):
     id: str
     started_at: str
@@ -79,6 +98,7 @@ __all__ = [
     "PackageManifest",
     "PackagePermissions",
     "PackageResources",
+    "SessionEvent",
     "SessionMeta",
     "SnapshotEntry",
     "ToolCallRecord",

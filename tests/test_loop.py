@@ -6,6 +6,7 @@ import json
 from markbot.kernel.config import with_agent
 from markbot.kernel.providers.base import ModelReply, ToolCall
 from markbot.kernel.providers.echo import ScriptedProvider
+from markbot.schema.session_log import SessionLog, trajectory_text
 
 
 def test_plain_completion_is_archived(make_kernel):
@@ -39,12 +40,7 @@ def test_turns_share_session(make_kernel):
         "第二问",
     ]
     asyncio.run(kernel.shutdown())
-    rows = [
-        json.loads(line)
-        for line in (
-            kernel.home / "sessions" / first.session_id / "trajectory.jsonl"
-        ).read_text(encoding="utf-8").splitlines()
-    ]
+    rows = SessionLog(kernel.home / "sessions" / first.session_id).trajectory()
     assert len(rows) == 4
 
 
@@ -67,12 +63,7 @@ def test_tool_roundtrip(make_kernel):
     result = asyncio.run(kernel.run("调用 echo"))
     assert result.text == "工具已返回 hi"
     assert result.stopped_reason == "completed"
-    rows = [
-        json.loads(line)
-        for line in (kernel.home / "sessions" / result.session_id / "trajectory.jsonl")
-        .read_text(encoding="utf-8")
-        .splitlines()
-    ]
+    rows = SessionLog(kernel.home / "sessions" / result.session_id).trajectory()
     assert [row["role"] for row in rows] == ["user", "assistant", "tool", "assistant"]
     assert rows[2]["content"] == "hi"
 
@@ -88,9 +79,7 @@ def test_unknown_tool_is_recoverable(make_kernel):
     result = asyncio.run(kernel.run("用不存在的工具"))
     assert result.status if hasattr(result, "status") else True
     assert result.text == "已改用其他路径"
-    trajectory = (
-        kernel.home / "sessions" / result.session_id / "trajectory.jsonl"
-    ).read_text(encoding="utf-8")
+    trajectory = trajectory_text(kernel.home / "sessions" / result.session_id)
     assert "unknown tool: nope" in trajectory
 
 
@@ -182,6 +171,70 @@ def test_openai_provider_reports_error_after_retries(monkeypatch):
     assert calls["n"] == 2
 
 
+def test_moderation_marker_detection():
+    from markbot.kernel.providers.base import is_moderation_rejection
+
+    assert is_moderation_rejection(
+        '{"error":{"message":"Inappropriate input/output rejected for security reasons",'
+        '"type":"invalid_request_error","code":"18"}}'
+    )
+    assert not is_moderation_rejection('{"error":{"message":"field Tools[0].Type invalid"}}')
+
+
+def test_moderation_rejection_removes_offending_context(make_kernel):
+    """被上游内容审核拒绝时，定位并移除触发内容，而不是让会话永久失败。"""
+    from markbot.kernel.providers.base import ContentRejectedError
+
+    class Censored:
+        name = "censored"
+
+        async def complete(self, payload):
+            dump = json.dumps(payload, ensure_ascii=False)
+            if "banned.example" in dump:
+                raise ContentRejectedError(
+                    'provider HTTP 400 url=x: {"error":{"message":'
+                    '"Inappropriate input/output rejected for security reasons","code":"18"}}'
+                )
+            if not any(msg.get("role") == "tool" for msg in payload.get("messages", [])):
+                return ModelReply(
+                    tool_calls=[
+                        ToolCall(id="c1", name="echo", args={"text": "https://banned.example/x"})
+                    ]
+                )
+            return ModelReply(text="已跳过受限链接")
+
+    kernel = make_kernel(provider=Censored())
+    result = asyncio.run(kernel.run("看看这个链接"))
+    assert result.stopped_reason == "completed"
+    assert result.text.startswith("已跳过受限链接")
+    assert "内容安全策略" in result.text
+    trajectory = trajectory_text(kernel.home / "sessions" / result.session_id)
+    assert "banned.example" not in trajectory
+    assert "已从上下文中移除" in trajectory
+
+
+def test_moderation_rejection_without_offending_context_errors(make_kernel):
+    """找不到触发内容时立即给出可读错误，不做无意义重试。"""
+    from markbot.kernel.providers.base import ContentRejectedError
+
+    class Always:
+        name = "always"
+
+        def __init__(self):
+            self.calls = 0
+
+        async def complete(self, payload):
+            self.calls += 1
+            raise ContentRejectedError("security reasons code 18")
+
+    provider = Always()
+    kernel = make_kernel(provider=provider)
+    result = asyncio.run(kernel.run("hi"))
+    assert result.stopped_reason == "error"
+    assert "内容安全策略" in (result.error or "")
+    assert provider.calls == 1
+
+
 def test_max_steps(make_kernel):
     provider = ScriptedProvider(
         [ModelReply(tool_calls=[ToolCall(id="c1", name="echo", args={"text": "x"})])]
@@ -207,9 +260,7 @@ def test_tool_call_can_be_blocked(make_kernel):
     kernel.events.subscribe("tool_call", "test", block)
     result = asyncio.run(kernel.run("试试"))
     assert result.text == "改用别的方式"
-    trajectory = (
-        kernel.home / "sessions" / result.session_id / "trajectory.jsonl"
-    ).read_text(encoding="utf-8")
+    trajectory = trajectory_text(kernel.home / "sessions" / result.session_id)
     assert "extension denied" in trajectory
 
 
@@ -236,7 +287,7 @@ def test_missing_session_id_starts_fresh_session(make_kernel):
     asyncio.run(first_kernel.run("第一问"))
 
     second_kernel = make_kernel(["第二轮"])
-    second = asyncio.run(second_kernel.run("第二问"))
+    asyncio.run(second_kernel.run("第二问"))
 
     assert len([m for m in second_kernel.session.messages if m.role == "user"]) == 1
 

@@ -8,6 +8,7 @@ from markbot.kernel.config import load_config
 from markbot.kernel.providers.base import ModelReply
 from markbot.kernel.providers.echo import ScriptedProvider
 from markbot.kernel.session import COMPACTION_PREFIX, Session
+from markbot.schema.session_log import SessionLog
 
 
 class _SummaryAwareProvider:
@@ -60,7 +61,9 @@ def test_auto_compaction_when_budget_exceeded(make_kernel, home, project):
 
     asyncio.run(kernel.shutdown())
     session_dir = kernel.home / "sessions" / result.session_id
-    assert (session_dir / "compacted.jsonl").exists()
+    # 压缩原文在事件日志的 compaction 事件里，不再单独写 compacted.jsonl（ADR 0007）
+    assert SessionLog(session_dir).compacted()
+    assert not (session_dir / "compacted.jsonl").exists()
 
 
 def test_scripted_provider_still_works_after_compaction(make_kernel, home, project):

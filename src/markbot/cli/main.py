@@ -3,26 +3,21 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import os
 import shutil
 import sys
 import tempfile
 import threading
-import time
 import tomllib
-import urllib.request
-import uuid
 from pathlib import Path
-from typing import Any
 
 from markbot.api.ui import ConsoleUI, NullUI
 from markbot.cli.gateway import gateway_command
+from markbot.cli.secrets_cmd import secrets_command
+from markbot.cli.sessions_cmd import sessions_command
 from markbot.cron.cli import cron_command
-from markbot.cron.runner import build_job_runner
-from markbot.cron.service import CronService, set_service
-from markbot.kernel import gateway_log
+from markbot.kernel import gateway_log, local_auth
 from markbot.kernel.app import Kernel
 from markbot.kernel.config import Config, load_config, markbot_home
 from markbot.kernel.permissions import parse_capabilities, uncovered_capabilities
@@ -39,8 +34,19 @@ from markbot.memory.store import MemoryStore
 from markbot.optimizer.gate import illegal_paths
 from markbot.optimizer.run import OptimizerSettings, optimize
 from markbot.optimizer.snapshots import list_snapshots, restore_snapshot
+from markbot.server.http import (  # noqa: F401 - 兼容旧引用（测试与外部脚本）
+    _ChatConfirmUI,
+    _hook_url,
+    _idle_archive_loop,
+    _memory_idle_loop,
+    _resolve_confirm,
+    _runtime_fingerprint,
+    _sanitize_grants,
+    _watch_runtime,
+    run_server,
+)
 
-HELP = """MarkBot2 —— 极薄 Kernel + 四条扩展车道
+HELP = """MarkBot —— 极薄 Kernel + 四条扩展车道
 
 用法：
   markbot init [--force]        初始化 ~/.markbot（配置文件与默认目录）
@@ -54,17 +60,22 @@ HELP = """MarkBot2 —— 极薄 Kernel + 四条扩展车道
   markbot reload                重新合成运行时视图
   markbot cron list|add|run|history
                                 管理定时任务（调度器在 serve/gateway 进程里运行）
-  markbot optimize [--dry-run] [--k N]
+  markbot optimize [--dry-run] [--k N] [--approve-skills]
   markbot rollback [--list] [--to HASH]
   markbot memory status|search|consolidate|restore
                                 查看、检索、整理与回滚长期记忆
-  markbot serve [--port 8787]
+  markbot serve [--port 8787] [--host 127.0.0.1] [--allow-remote]
   markbot gateway start|stop|restart|status
+  markbot sessions status|migrate [--dry-run]
+                                会话归档存储统计；清理可从 events.jsonl 重建的派生文件
+  markbot secrets status|migrate [--dry-run]
+                                检查 / 迁移 config.toml 里的明文密钥到 secrets.toml（0600）
                                 后台托管 HTTP 入口与飞书渠道（日志在 ~/.markbot/gateway/）
 
 配置：
   ~/.markbot/config.toml        模型、权限、包与优化器配置（markbot init 生成）
   ~/.markbot/trust.json         包信任表
+  ~/.markbot/secrets.toml       密钥（api_key、[secrets]、渠道密钥），权限 0600
 
 环境变量：
   MARKBOT_HOME                  覆盖 ~/.markbot
@@ -147,6 +158,16 @@ def _print_summary(kernel: Kernel) -> None:
         print(f"warning: {warning}", file=sys.stderr)
 
 
+DEFAULT_SECRETS = """\
+# MarkBot 密钥文件：权限必须是 0600，不要提交、同步或分享。
+# 结构与 config.toml 相同，加载时叠加在 config.toml 之上。
+[agent]
+# api_key = ""
+
+[secrets]
+# FEISHU_APP_SECRET = ""
+"""
+
 DEFAULT_DIRS = (
     "packages",
     "learned",
@@ -162,12 +183,12 @@ DEFAULT_DIRS = (
 )
 
 DEFAULT_CONFIG = """\
-# MarkBot2 用户配置（由 `markbot init` 生成，可自由修改）
+# MarkBot 用户配置（由 `markbot init` 生成，可自由修改）
 [agent]
 provider = ""                  # openai_compat | anthropic | echo；留空按 model 推断
 model = "claude-sonnet-4-5"
 base_url = ""                  # 覆盖默认接口地址
-api_key = ""                   # 模型服务密钥
+api_key = ""                   # 不要写在这里：放到 secrets.toml，或写 "env:OPENAI_API_KEY"
 max_tokens = 4096
 max_steps = 30
 tool_timeout_s = 60
@@ -189,9 +210,22 @@ confirm_on_exec = true
 [packages]
 allow_project_packages = false # 允许加载 <project>/.markbot/ 下的包
 
-# 供技能/扩展通过 secret:<name> 读取的密钥，不进模型上下文
+# MCP server（需要安装可选依赖：pip install "markbot[mcp]"）
+# [tools.mcp_servers.filesystem]
+# type = "stdio"                # stdio | sse | streamableHttp；留空按 command/url 推断
+# command = "npx"
+# args = ["-y", "@modelcontextprotocol/server-filesystem", "/path/to/dir"]
+# enabled_tools = ["*"]         # ["*"] = 全部能力；指定名单时只注册这些工具，不注册资源/提示
+# tool_timeout = 30             # 单次调用超时（秒）
+#
+# [tools.mcp_servers.remote]
+# url = "https://example.com/mcp"
+# headers = { Authorization = "Bearer ${MCP_TOKEN}" }  # ${VAR} 从进程环境变量展开
+
+# 供技能/扩展通过 secret:<name> 读取的密钥，不进模型上下文。
+# 取值请写在 secrets.toml（0600）里；这里只适合写 "env:NAME" 形式的引用。
 [secrets]
-# EXAMPLE_KEY = ""
+# EXAMPLE_KEY = "env:EXAMPLE_KEY"
 
 [ui]
 show_progress = true           # 交互模式下显示模型请求/工具调用等过程提示
@@ -200,7 +234,10 @@ show_progress = true           # 交互模式下显示模型请求/工具调用�
 [logging]
 enabled = true
 runtime = true
-interaction = true
+interaction = false            # 交互日志含完整模型报文（已脱敏），排查问题时再打开
+retention_days = 30            # runtime / gateway 按日文件保留天数
+interaction_retention_days = 7
+max_total_mb = 500             # logs/ + gateway/ 总量上限，超出从最旧的交互日志开始删
 
 [optimizer]
 enabled = true
@@ -209,6 +246,8 @@ max_rollouts_per_task = 4
 max_sessions_per_task = 3
 max_tasks_per_run = 5
 idle_minutes = 30
+min_eval_cases = 10            # 回归集少于此数不晋升
+llm_judge = false              # 用当前模型给 llm_judge 检查打分
 
 # 定时任务：调度器在 `markbot serve` / `markbot gateway start` 里运行
 [cron]
@@ -228,13 +267,19 @@ index_max_chars = 2000         # wiki 索引注入上限
 notice_compaction = false      # 压缩是否在交互界面提示
 show_stale = true              # 过期条目是否注入（带"待复核"标注）
 
-# 渠道是外置进程，按需启用；app_secret 写到上面的 [secrets]：
+# 渠道是外置进程，按需启用；app_secret 写到 secrets.toml 的 [secrets]：
 # FEISHU_APP_SECRET = "..."
 # [channels.feishu]
 # app_id = "cli_xxx"
 # verification_token = "xxx"
 # port = 8790
 # markbot_url = "http://127.0.0.1:8787"
+# streaming = true             # 用 CardKit 流式卡片展示模型输出
+#
+# 入站语音转写（可选，密钥也可以放到 [secrets].TRANSCRIPTION_API_KEY）：
+# [transcription]
+# enabled = true
+# provider = "groq"            # groq | openai
 """
 
 
@@ -257,13 +302,23 @@ def cmd_init(argv: list[str]) -> int:
     else:
         print(f"配置已存在，保留: {config}（覆盖请加 --force）")
 
+    secrets_file = home / "secrets.toml"
+    if not secrets_file.exists():
+        fd = os.open(secrets_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(DEFAULT_SECRETS)
+        print(f"已创建密钥文件: {secrets_file}（0600）")
+
     trust = home / "trust.json"
     if not trust.exists():
         trust.write_text("{}\n", encoding="utf-8")
         print(f"已创建信任表: {trust}")
 
     print(f"MarkBot2 home 已就绪: {home}")
-    print(f"下一步：编辑 {config} 填写 provider/model/base_url/api_key，然后运行 markbot doctor")
+    print(
+        f"下一步：编辑 {config} 填写 provider/model/base_url，"
+        f"把 api_key 写进 {secrets_file}，然后运行 markbot doctor"
+    )
     return 0
 
 
@@ -332,7 +387,17 @@ def _dependency_errors(root: Path) -> list[str]:
     rules = [
         ("kernel", ("from markbot.extensions", "import markbot.extensions")),
         ("kernel", ("from markbot.optimizer", "import markbot.optimizer")),
+        # 记忆是扩展车道上的提供者（runtime.entries["context_providers"]），Kernel 不依赖它
+        ("kernel", ("from markbot.memory", "import markbot.memory")),
         ("extensions", ("from markbot.kernel", "import markbot.kernel")),
+        # schema 是纯数据、api 是冻结契约：都不能依赖实现层
+        ("schema", ("from markbot.api", "from markbot.kernel", "from markbot.memory",
+                    "from markbot.optimizer", "from markbot.cron")),
+        ("api", ("from markbot.kernel", "from markbot.memory", "from markbot.optimizer",
+                 "from markbot.cron", "from markbot.extensions")),
+        # memory 是扩展与 CLI 使用的库层：不能依赖 kernel/optimizer
+        ("memory", ("from markbot.kernel", "import markbot.kernel",
+                    "from markbot.optimizer", "import markbot.optimizer")),
     ]
     errors: list[str] = []
     for package, needles in rules:
@@ -541,11 +606,12 @@ def cmd_reload(argv: list[str]) -> int:
 
 
 def _make_run_case(cfg: Config, provider):
-    cache: dict[str, Kernel] = {}
     fixtures_root = Path(cfg.project_root) / "evals"
 
     async def run_case(harness_dir: Path, case) -> str:
-        key = str(Path(harness_dir).resolve())
+        # 每条用例一个全新 Kernel：工作区、权限守卫与执行环境都绑定在本用例的临时目录上。
+        # 旧实现按 harness 缓存 Kernel 并只改 policy.root，执行环境仍指向第一条用例
+        # 已删除的临时目录，第二条起的用例读不到 fixtures，评分被系统性拉低。
         with tempfile.TemporaryDirectory() as tmp:
             workspace = Path(tmp).resolve()
             for rel in case.files:
@@ -555,22 +621,48 @@ def _make_run_case(cfg: Config, provider):
                 dst = workspace / rel
                 dst.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(src, dst)
-            kernel = cache.get(key)
-            if kernel is None:
-                kernel = Kernel.build(
-                    config=cfg,
-                    provider=provider,
-                    include_packages=False,
-                    learned_dir=Path(harness_dir),
-                    ui=NullUI(),
-                    workspace=workspace,
-                )
-                cache[key] = kernel
-            kernel.policy.root = workspace
-            result = await kernel.run(case.prompt, archive=False)
+            kernel = Kernel.build(
+                config=cfg,
+                provider=provider,
+                include_packages=False,
+                learned_dir=Path(harness_dir),
+                ui=NullUI(),
+                workspace=workspace,
+            )
+            try:
+                result = await kernel.run(case.prompt, archive=False)
+            finally:
+                # 不归档：评测会话不能进入 sessions/，否则会被当成「已完成的真实会话」
+                await kernel.shutdown(archive=False)
             return result.text or ""
 
     return run_case
+
+
+JUDGE_SYSTEM = (
+    "你是严格的评分员。根据评分标准判断回答是否合格。"
+    "只输出一个词：PASS 或 FAIL，不要解释。"
+)
+
+
+def _make_judge(provider):
+    async def judge(answer: str, rubric: str) -> bool:
+        reply = await provider.complete(
+            {
+                "system": JUDGE_SYSTEM,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": f"评分标准：\n{rubric}\n\n待评回答：\n{answer[:8000]}",
+                    }
+                ],
+                "max_tokens": 8,
+            }
+        )
+        verdict = (getattr(reply, "text", "") or "").strip().upper()
+        return verdict.startswith("PASS")
+
+    return judge
 
 
 def cmd_optimize(argv: list[str]) -> int:
@@ -602,6 +694,9 @@ def cmd_optimize(argv: list[str]) -> int:
         max_sessions_per_task=cfg.optimizer.max_sessions_per_task,
         max_tasks_per_run=cfg.optimizer.max_tasks_per_run,
         idle_minutes=cfg.optimizer.idle_minutes,
+        min_eval_cases=cfg.optimizer.min_eval_cases,
+        approve_skills="--approve-skills" in argv,
+        judge=_make_judge(provider) if cfg.optimizer.llm_judge else None,
     )
     report = asyncio.run(
         optimize(
@@ -759,187 +854,6 @@ def cmd_memory(argv: list[str]) -> int:
     return 2
 
 
-_WATCH_SKIP_DIRS = {"__pycache__", ".git", "node_modules", ".venv", ".ruff_cache"}
-
-
-def _runtime_fingerprint(kernel: Kernel) -> tuple[tuple[str, int, int], ...]:
-    """收集扩展相关路径的 mtime/size 指纹，用于发现插件安装、删除与信任变更。"""
-    roots = [
-        kernel.home / "packages",
-        kernel.home / "learned",
-        kernel.home / "trust.json",
-        kernel.project_root / "capabilities",
-        kernel.project_root / ".markbot",
-    ]
-    entries: list[tuple[str, int, int]] = []
-    for root in roots:
-        if not root.exists():
-            entries.append((str(root), -1, -1))
-            continue
-        if root.is_file():
-            stat = root.stat()
-            entries.append((str(root), stat.st_mtime_ns, stat.st_size))
-            continue
-        for dirpath, dirnames, filenames in os.walk(root):
-            dirnames[:] = sorted(d for d in dirnames if d not in _WATCH_SKIP_DIRS)
-            for name in sorted(filenames):
-                path = Path(dirpath) / name
-                try:
-                    stat = path.stat()
-                except OSError:
-                    continue
-                entries.append((str(path), stat.st_mtime_ns, stat.st_size))
-    return tuple(entries)
-
-
-def _watch_runtime(
-    kernel: Kernel, run_lock: Any, interval_s: float = 2.0
-) -> None:
-    fingerprint = _runtime_fingerprint(kernel)
-    while True:
-        time.sleep(interval_s)
-        current = _runtime_fingerprint(kernel)
-        if current == fingerprint:
-            continue
-        time.sleep(0.5)  # 等待写入完成，避免读到半个文件
-        fingerprint = _runtime_fingerprint(kernel)
-        with run_lock:
-            try:
-                view = kernel.reload()
-            except Exception as exc:  # noqa: BLE001
-                print(f"[watch] 重新加载失败: {exc}", file=sys.stderr)
-                continue
-        print(
-            f"[watch] 检测到扩展变更，已重新加载 tools={len(view.tools)} "
-            f"skills={len(view.skills)}",
-            file=sys.stderr,
-        )
-        for warning in kernel.warnings:
-            print(f"[watch] warning: {warning}", file=sys.stderr)
-
-
-_CONFIRM_LOCK = threading.Lock()
-_PENDING_CONFIRMS: dict[str, dict[str, Any]] = {}
-
-
-class _ChatConfirmUI(NullUI):
-    """把工具的确认请求转发到聊天，并等待用户回复。
-
-    服务端无法直接给用户发消息，因此把问题 POST 给渠道（``hook``），渠道负责
-    发消息；用户在聊天里回复后，渠道回调 ``POST /confirm`` 唤醒这里。
-    """
-
-    def __init__(
-        self,
-        hook: str,
-        chat_id: str,
-        user_id: str = "",
-        timeout_s: float = 180.0,
-    ) -> None:
-        self._hook = hook
-        self._chat_id = chat_id
-        self._user_id = user_id
-        self._timeout_s = timeout_s
-
-    async def confirm(self, title: str, message: str) -> bool:
-        token = uuid.uuid4().hex
-        slot = {"event": threading.Event(), "approved": False}
-        with _CONFIRM_LOCK:
-            _PENDING_CONFIRMS[token] = slot
-        try:
-            body = json.dumps(
-                {
-                    "token": token,
-                    "chat_id": self._chat_id,
-                    "user_id": self._user_id,
-                    "title": title,
-                    "message": message,
-                },
-                ensure_ascii=False,
-            ).encode("utf-8")
-            request = urllib.request.Request(
-                self._hook,
-                data=body,
-                headers={"Content-Type": "application/json"},
-                method="POST",
-            )
-            urllib.request.urlopen(request, timeout=10).read()
-            delivered = True
-        except Exception as exc:  # noqa: BLE001 - 渠道不可达时按拒绝处理
-            logging.getLogger("markbot.serve").warning("确认请求发送失败: %s", exc)
-            delivered = False
-        if not delivered:
-            with _CONFIRM_LOCK:
-                _PENDING_CONFIRMS.pop(token, None)
-            return False
-        try:
-            await asyncio.to_thread(slot["event"].wait, self._timeout_s)
-        finally:
-            with _CONFIRM_LOCK:
-                _PENDING_CONFIRMS.pop(token, None)
-        return bool(slot["approved"] and slot["event"].is_set())
-
-
-def _resolve_confirm(token: str, approved: bool) -> bool:
-    with _CONFIRM_LOCK:
-        slot = _PENDING_CONFIRMS.get(token)
-    if slot is None:
-        return False
-    slot["approved"] = bool(approved)
-    slot["event"].set()
-    return True
-
-
-def _memory_idle_loop(kernel: Kernel, run_lock: threading.Lock, idle_minutes: int) -> None:
-    """定期整理记忆；模型调用不占锁，只有落盘/回滚阶段与聊天串行。"""
-    logger = logging.getLogger("markbot.memory")
-    interval = max(60, int(idle_minutes) * 60)
-    while True:
-        time.sleep(interval)
-        try:
-            report = asyncio.run(
-                Consolidator(
-                    kernel.home / "learned",
-                    home=kernel.home,
-                    provider=kernel.provider,
-                    max_sessions=kernel.config.memory.max_sessions_per_run,
-                    apply_lock=run_lock,
-                ).run()
-            )
-            logger.info(
-                "记忆整理 sessions=%d written=%d skipped=%d failed=%d cursor=%s",
-                report.sessions,
-                report.written,
-                report.skipped,
-                report.failed,
-                report.cursor_advanced,
-            )
-        except Exception:  # noqa: BLE001 - 后台线程不能因单次失败退出
-            logger.exception("记忆整理异常")
-
-
-def _idle_archive_loop(
-    kernel: Kernel, run_lock: threading.Lock, idle_minutes: int
-) -> None:
-    """长驻会话空闲后补写归档，让整理器能看到聊到一半的内容。
-
-    每 60 秒检查一次；内核忙时直接跳过，下个周期再试。
-    """
-    logger = logging.getLogger("markbot.memory")
-    while True:
-        time.sleep(60)
-        if not run_lock.acquire(blocking=False):
-            continue
-        try:
-            sessions = asyncio.run(kernel.archive_idle(idle_minutes))
-            if sessions:
-                logger.info("空闲归档 sessions=%d", len(sessions))
-        except Exception:  # noqa: BLE001 - 后台线程不能因单次失败退出
-            logger.exception("空闲归档异常")
-        finally:
-            run_lock.release()
-
-
 def cmd_serve(argv: list[str]) -> int:
     port = 8787
     if "--port" in argv:
@@ -949,217 +863,23 @@ def cmd_serve(argv: list[str]) -> int:
     if "--host" in argv:
         index = argv.index("--host")
         host = argv[index + 1]
+    if not local_auth.is_loopback_host(host) and "--allow-remote" not in argv:
+        print(
+            f"error: 拒绝监听非回环地址 {host}：/chat 可以驱动工具执行。"
+            "确需对外提供服务请加 --allow-remote，并放在反向代理/防火墙之后。",
+            file=sys.stderr,
+        )
+        return 2
+    auth_token = local_auth.load_or_create_token(markbot_home())
     log_file = gateway_log.install(markbot_home())
     logger = logging.getLogger("markbot.serve")
     logger.info("HTTP 入口启动 %s:%d，日志: %s", host, port, log_file)
     kernel = _build(ui=NullUI(), gateway_logs=True)
     if kernel is None:
         return 2
-    import threading
-    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-
-    # 同一 Kernel 的会话是有状态的，HTTP 请求串行执行。
-    run_lock = threading.Lock()
-    threading.Thread(
-        target=_watch_runtime, args=(kernel, run_lock), daemon=True, name="runtime-watch"
-    ).start()
-
-    cron: CronService | None = None
-    if kernel.config.cron.enabled:
-        cron = CronService(
-            kernel.home / "cron" / "jobs.json",
-            on_job=build_job_runner(kernel, run_lock=run_lock),
-            default_delivery=kernel.config.cron.default_delivery,
-            default_timezone=kernel.config.cron.timezone or None,
-        )
-        set_service(cron)
-        cron.start_in_thread()
-        logger.info("定时任务调度器已启动 store=%s", cron.store_path)
-    else:
-        logger.info("定时任务调度器已关闭（[cron] enabled = false）")
-
-    if (
-        kernel.config.memory.enabled
-        and kernel.config.memory.auto_consolidate
-        and kernel.config.memory.idle_minutes > 0
-    ):
-        threading.Thread(
-            target=_memory_idle_loop,
-            args=(kernel, run_lock, kernel.config.memory.idle_minutes),
-            daemon=True,
-            name="memory-idle",
-        ).start()
-        logger.info(
-            "记忆整理已启用 interval_minutes=%d", kernel.config.memory.idle_minutes
-        )
-    else:
-        logger.info("记忆整理未启用（[memory] enabled/auto_consolidate/idle_minutes）")
-
-    if kernel.config.memory.enabled and kernel.config.memory.idle_archive_minutes > 0:
-        threading.Thread(
-            target=_idle_archive_loop,
-            args=(kernel, run_lock, kernel.config.memory.idle_archive_minutes),
-            daemon=True,
-            name="memory-idle-archive",
-        ).start()
-        logger.info(
-            "空闲归档已启用 idle_minutes=%d",
-            kernel.config.memory.idle_archive_minutes,
-        )
-    else:
-        logger.info("空闲归档未启用（[memory] enabled/idle_archive_minutes）")
-
-    class Handler(BaseHTTPRequestHandler):
-        def _json(self, status: int, payload: dict[str, Any]) -> None:
-            body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-            self.send_response(status)
-            self.send_header("Content-Type", "application/json; charset=utf-8")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-
-        def do_GET(self) -> None:  # noqa: N802
-            if self.path == "/health":
-                jobs = 0
-                if cron is not None:
-                    try:
-                        jobs = len(cron.list_jobs())
-                    except Exception:  # noqa: BLE001 - 健康检查不能因坏文件失败
-                        jobs = -1
-                self._json(
-                    200,
-                    {
-                        "status": "ok",
-                        "tools": len(kernel.runtime.tools),
-                        "skills": len(kernel.runtime.skills),
-                        "cron": {"enabled": cron is not None, "jobs": jobs},
-                    },
-                )
-            else:
-                self._json(404, {"error": "not found"})
-
-        def do_POST(self) -> None:  # noqa: N802
-            try:
-                if self.path == "/confirm":
-                    self._confirm()
-                else:
-                    self._chat()
-            except Exception:  # noqa: BLE001 - 兜底，避免请求线程静默退出
-                logging.getLogger("markbot.http").exception("处理请求失败 path=%s", self.path)
-                try:
-                    self._json(500, {"error": "internal error"})
-                except OSError:
-                    pass
-
-        def _confirm(self) -> None:
-            length = int(self.headers.get("Content-Length") or 0)
-            try:
-                data = json.loads(self.rfile.read(length) or b"{}")
-            except ValueError:
-                self._json(400, {"error": "invalid json"})
-                return
-            token = str(data.get("token") or "")
-            ok = _resolve_confirm(token, bool(data.get("approved")))
-            logger.info("/confirm token=%s approved=%s ok=%s", token[:8], data.get("approved"), ok)
-            self._json(200 if ok else 404, {"ok": ok})
-
-        def _chat(self) -> None:
-            if self.path != "/chat":
-                self._json(404, {"error": "not found"})
-                return
-            length = int(self.headers.get("Content-Length") or 0)
-            try:
-                data = json.loads(self.rfile.read(length) or b"{}")
-                prompt = str(data.get("prompt") or "")
-                session_id = str(data.get("session_id") or "") or None
-                grants = [str(item) for item in (data.get("grants") or []) if str(item).strip()]
-                confirm_hook = data.get("confirm_hook") or {}
-                notify_hook = data.get("notify_hook") or {}
-            except ValueError:
-                self._json(400, {"error": "invalid json"})
-                return
-            if not prompt:
-                self._json(400, {"error": "prompt is required"})
-                return
-            logger.info(
-                "/chat 请求 session=%s prompt_chars=%d grants=%s",
-                session_id or "-",
-                len(prompt),
-                ",".join(grants) or "-",
-            )
-            with run_lock:
-                added = kernel.policy.push_grants(grants) if grants else set()
-                previous_ui = None
-                hook_url = str(confirm_hook.get("url") or "")
-                if hook_url:
-                    previous_ui = kernel.set_ui(
-                        _ChatConfirmUI(
-                            hook_url,
-                            str(confirm_hook.get("chat_id") or ""),
-                            str(confirm_hook.get("user_id") or ""),
-                        )
-                    )
-                # 渠道把“主动发消息”的回调地址带进来，cron 工具据此决定结果投递到哪
-                notify_url = str(notify_hook.get("url") or "")
-                notify_chat = str(notify_hook.get("chat_id") or "")
-                metadata = (
-                    {"notify": {"url": notify_url, "chat_id": notify_chat}}
-                    if notify_url and notify_chat
-                    else None
-                )
-                try:
-                    result = asyncio.run(
-                        kernel.run(
-                            prompt,
-                            session_id=session_id,
-                            new_session=not session_id,
-                            metadata=metadata,
-                        )
-                    )
-                finally:
-                    if previous_ui is not None:
-                        kernel.set_ui(previous_ui)
-                    if added:
-                        kernel.policy.pop_grants(added)
-            logger.info(
-                "/chat 完成 session=%s reason=%s error=%s",
-                result.session_id,
-                result.stopped_reason,
-                result.error,
-            )
-            self._json(
-                200,
-                {
-                    "text": result.text,
-                    "stopped_reason": result.stopped_reason,
-                    "error": result.error,
-                    "session_id": result.session_id,
-                },
-            )
-
-        def log_message(self, fmt: str, *args: Any) -> None:
-            logging.getLogger("markbot.http").info(fmt % args)
-
-    server = ThreadingHTTPServer((host, port), Handler)
-    print(f"MarkBot2 HTTP 入口: http://{host}:{port}  (GET /health, POST /chat, POST /confirm)")
-    print(f"运行日志: {log_file}")
-    print(
-        f"定时任务: {'已启用 ' + str(cron.store_path) if cron is not None else '已禁用'}"
+    return run_server(
+        kernel, host=host, port=port, log_file=log_file, auth_token=auth_token
     )
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        pass
-    except Exception:  # noqa: BLE001 - 记录后退出，避免无提示挂起
-        logger.exception("HTTP 服务异常退出")
-        return 1
-    finally:
-        if cron is not None:
-            cron.stop()
-            set_service(None)
-        server.server_close()
-        asyncio.run(kernel.shutdown())
-    return 0
 
 
 COMMANDS = {
@@ -1177,6 +897,8 @@ COMMANDS = {
     "memory": cmd_memory,
     "serve": cmd_serve,
     "gateway": gateway_command,
+    "secrets": secrets_command,
+    "sessions": sessions_command,
 }
 
 
@@ -1205,4 +927,16 @@ def main(argv: list[str] | None = None) -> int:
     return 0 if not result.error else 1
 
 
-__all__ = ["main"]
+__all__ = [
+    "main",
+    # 兼容旧引用：HTTP 服务实现已移到 markbot.server.http
+    "_ChatConfirmUI",
+    "_hook_url",
+    "_idle_archive_loop",
+    "_memory_idle_loop",
+    "_resolve_confirm",
+    "_runtime_fingerprint",
+    "_sanitize_grants",
+    "_watch_runtime",
+    "run_server",
+]

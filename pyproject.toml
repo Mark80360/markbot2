@@ -20,7 +20,8 @@ dependencies = [
 office = ["openpyxl>=3.1,<4"]
 channels = ["lark-oapi>=1.8,<2"]
 cron = ["croniter>=2,<7"]
-dev = ["pytest>=8", "ruff>=0.5"]
+mcp = ["mcp>=1.0,<2"]
+dev = ["pytest>=8", "ruff>=0.5", "pyright>=1.1.380"]
 
 [project.scripts]
 markbot = "markbot.cli.main:main"
@@ -41,4 +42,17 @@ src = ["src"]
 extend-exclude = ["capabilities", "evals"]
 
 [tool.ruff.lint]
+# 阻断门禁（AGENTS.md）。更严格的规则见 scripts/lint_strict.sh：先以「棘轮」方式
+# 跑出存量问题并逐步清零，清零的规则再挪进这里，避免一次性把门禁打红。
 select = ["E4", "E7", "E9", "F", "I"]
+
+[tool.ruff.lint.per-file-ignores]
+# 渠道入口在补齐 sys.path 之后才能导入同级模块
+"channels/feishu/channel.py" = ["E402"]
+
+[tool.pyright]
+include = ["src"]
+pythonVersion = "3.12"
+typeCheckingMode = "basic"
+reportMissingImports = "warning"
+reportMissingModuleSource = "none"

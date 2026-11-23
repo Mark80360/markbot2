@@ -184,9 +184,6 @@ def _history(service: CronService, args: CronIn) -> ToolResult:
         lines.append(head)
         if run.error:
             lines.append(f"  错误: {run.error}")
-        preview = run.response.strip().replace("\n", " ")
-        if preview:
-            lines.append(f"  结果: {preview[:200]}")
     return ToolResult("\n".join(lines))
 
 

@@ -17,6 +17,7 @@ from markbot.memory.lifespan import annotate, inject_line, split_meta, status
 from markbot.memory.provider import MemoryProvider
 from markbot.memory.store import MemoryStore
 from markbot.optimizer.gate import allowed_path
+from markbot.schema.session_log import trajectory_text
 
 SECRET = "api_key=sk-abcdefghijklmnopqrstuvwxyz012345"
 
@@ -148,9 +149,7 @@ def test_memory_tool_roundtrip_records_receipt(make_kernel, home):
 
     text = (home / "learned" / "strategy" / "memory.md").read_text(encoding="utf-8")
     assert "回复用中文" in text
-    trajectory = (
-        home / "sessions" / result.session_id / "trajectory.jsonl"
-    ).read_text(encoding="utf-8")
+    trajectory = trajectory_text(home / "sessions" / result.session_id)
     assert "校验通过" in trajectory
     assert "memory_remember" in trajectory
 

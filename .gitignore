@@ -1,3 +1,4 @@
+# Python 构建产物与缓存
 __pycache__/
 *.py[cod]
 *.egg-info/
@@ -5,12 +6,54 @@ build/
 dist/
 .venv/
 venv/
+env/
 .pytest_cache/
 .ruff_cache/
+.mypy_cache/
 .coverage
+.coverage.*
 htmlcov/
-.markbot/
-output/
 ${APPDATA}/
-.screenshots/
+# 历史手工补丁备份：纳入 git 后不再需要
+.patch_backup/
+
+# MarkBot 运行时数据（含密钥、会话、日志、记忆与渠道数据）
+.markbot/
+*.db
+*.sqlite
+*.sqlite3
+
+# 日志与临时输出
+logs/
+*.log
+output/
+# 内部设计文档：不公开上传
 docs/
+.screenshots/
+*.tmp
+*.bak
+*.orig
+
+# 密钥与环境变量
+secrets.toml
+auth.token
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+
+# 媒体文件
+media/
+*.mp4
+*.wav
+*.mp3
+
+# 操作系统 / 编辑器
+.DS_Store
+Thumbs.db
+desktop.ini
+.idea/
+.vscode/

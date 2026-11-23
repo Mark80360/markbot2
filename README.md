@@ -5,7 +5,7 @@ MarkBot2 是一个 **1 + N** 形态的个人助手 Agent：
 - **1 个极薄 Kernel**：只负责上下文/模型调用、工具执行、会话持久化、生命周期事件、权限策略、运行时视图合成与配置信任。
 - **N 条扩展车道**：代码扩展、技能、分发包、学习层。增删能力不改 Kernel。
 - **可演化**：离线优化器读取已完成会话，产出更好的策略/技能，经回归门禁审核后晋升到学习层。
-- **有边界**：能力清单 + 三档权限 + 信任表 + 子进程沙箱；所有演化可审计、可回滚。
+- **有边界**：能力清单 + 三档权限 + 信任表 + 子进程隔离（可选 macOS `sandbox-exec`）；所有演化可审计、可回滚。
 
 完整设计见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)。
 
@@ -13,7 +13,7 @@ MarkBot2 是一个 **1 + N** 形态的个人助手 Agent：
 
 ## 环境要求
 
-- Python **3.12+**（开发使用 3.14 验证）
+- Python **3.12+**
 - 可选：`openpyxl`（Office 能力包）
 - 可选：联网模型服务（Anthropic / OpenAI 兼容接口）
 
@@ -27,6 +27,7 @@ python -m venv .venv
 
 pip install -e ".[dev]"          # 开发 + 测试
 pip install -e ".[office]"       # 需要 xlsx 能力时
+pip install -e ".[mcp]"          # 需要接入 MCP server 时
 ```
 
 安装后可用的入口：
@@ -38,19 +39,30 @@ python -m markbot --help          # 等价
 
 ## 配置模型服务
 
-所有配置都在 `~/.markbot/config.toml`（先运行 `markbot init`）：
+普通配置在 `~/.markbot/config.toml`，**密钥单独放在 `~/.markbot/secrets.toml`（0600）**，
+两者结构相同、加载时叠加（先运行 `markbot init`）：
 
 ```toml
+# ~/.markbot/config.toml
 [agent]
 provider = "openai_compat"     # openai_compat | anthropic | echo
 model = "sensenova-6.8-flash"
-base_url = "http://10.10.2.90:3000/v1"
-api_key = "sk-..."
+base_url = "http://127.0.0.1:3000/v1"   # 你的 OpenAI 兼容网关
+```
+
+```toml
+# ~/.markbot/secrets.toml（chmod 600，不要提交/同步）
+[agent]
+api_key = "sk-..."             # 也可以写 "env:OPENAI_API_KEY" 从环境变量读取
 
 # 供技能/扩展通过 secret:<name> 读取的密钥，不进模型上下文
 [secrets]
 EXAMPLE_KEY = "..."
+FEISHU_APP_SECRET = "..."
 ```
+
+已有部署把明文密钥写在 `config.toml` 时，启动会告警；运行 `markbot secrets migrate`
+无损迁移（`--dry-run` 先预览），迁移后请到对应平台**轮换**这些密钥。
 
 - `provider` 留空时按 `model` 推断：`claude*` / `anthropic*` 走 Anthropic，其余走 OpenAI 兼容接口。
 - 默认地址：Anthropic 为 `https://api.anthropic.com`，OpenAI 兼容为 `https://api.openai.com/v1`。
@@ -92,10 +104,12 @@ markbot packages               # 查看分发包与信任状态
 | `markbot packages` | 列出分发包与信任状态 |
 | `markbot trust <name> [--project] [--revoke]` | 信任 / 撤销信任一个包 |
 | `markbot reload` | 重新合成运行时视图 |
-| `markbot optimize [--dry-run] [--k N]` | 运行离线优化器 |
+| `markbot optimize [--dry-run] [--k N] [--approve-skills]` | 运行离线优化器（技能改动需 `--approve-skills`） |
 | `markbot rollback [--list] [--to HASH]` | 回滚学习层快照 |
-| `markbot serve [--host H] [--port P]` | 启动 HTTP 入口 |
+| `markbot serve [--host H] [--port P] [--allow-remote]` | 启动 HTTP 入口（实现位于 `markbot/server/`） |
 | `markbot gateway {start,stop,restart,status}` | 后台托管 HTTP 入口与飞书渠道，日志写入 `~/.markbot/gateway/YYYY-MM-DD.log` |
+| `markbot sessions {status,migrate [--dry-run]}` | 会话归档存储统计；清理可从 `events.jsonl` 重建的旧派生文件 |
+| `markbot secrets {status,migrate [--dry-run]}` | 检查 / 迁移 `config.toml` 里的明文密钥到 `secrets.toml` |
 | `markbot cron {list,add,run,history}` | 管理定时任务；调度器随 `serve`/`gateway` 启动，聊天内使用需先 `markbot trust cron` |
 
 > cron 表达式（`--cron "0 9 * * *"`）需要额外安装：`pip install -e ".[cron]"`；固定间隔与一次性任务不依赖 croniter。
@@ -116,6 +130,7 @@ max_tokens = 4096
 max_steps = 30
 tool_timeout_s = 60
 parallel_tools = true
+max_concurrent_turns = 4       # serve/gateway 同时执行的回合数；同一会话始终串行
 context_budget_chars = 60000   # 字符预算：超过 80% 触发压缩，压缩后保留最近约 40%
 
 [permissions]
@@ -126,8 +141,33 @@ confirm_on_exec = true
 # allow_exec = ["curl", "git"]
 # allow_commands = ["curl -s http://127.0.0.1:11235/*"]
 
+# 允许以环境变量注入命令的密钥 -> 允许使用它的程序（["*"] 不限）。
+# 值写在 [secrets]；模型调用 run_command 时只写 secrets=["NAME"]，命令里用 "$NAME" 引用，
+# 执行时才注入，模型、会话归档与日志里都只出现名称。
+# [permissions.secret_env]
+# CRAWL4AI_API_TOKEN = ["curl"]
+
+# MarkBot home（~/.markbot）整体受保护：文件工具与命令都不能读写学习层、配置、信任表、
+# 日志与会话归档（与档位无关）。默认开放 ~/.markbot/workspace（读写）与 ~/.markbot/media
+# （只读，渠道收到的图片/文件）；需要更多目录时在 [permissions] 下追加：
+# extra_writable_dirs = ["~/scratch"]
+# extra_readable_dirs = ["~/Downloads"]
+# extra_protected_dirs = ["~/.markbot_old"]   # 旧版数据目录等，同样禁止工具访问
+
 [packages]
 allow_project_packages = false # 开启后才加载 <project>/.markbot/
+
+# MCP server（需要安装可选依赖：pip install -e ".[mcp]"）
+# [tools.mcp_servers.filesystem]
+# type = "stdio"               # stdio | sse | streamableHttp；留空按 command/url 推断
+# command = "npx"
+# args = ["-y", "@modelcontextprotocol/server-filesystem", "/path/to/dir"]
+# enabled_tools = ["*"]        # ["*"] = 全部能力；指定名单时只注册这些工具，不注册资源/提示
+# tool_timeout = 30
+#
+# [tools.mcp_servers.remote]
+# url = "https://example.com/mcp"
+# headers = { Authorization = "Bearer ${MCP_TOKEN}" }  # ${VAR} 从进程环境变量展开
 
 # 供工具通过 secret:<name> 读取的密钥，不进入模型上下文
 [secrets]
@@ -139,7 +179,10 @@ show_progress = true           # 交互模式显示过程提示，false 则只�
 [logging]
 enabled = true                 # 总开关
 runtime = true                 # logs/runtime/YYYY-MM-DD.md
-interaction = true             # logs/interaction/YYYY-MM-DD.md（含完整模型报文）
+interaction = true             # logs/interaction/YYYY-MM-DD.md（含完整模型报文；init 模板默认 false）
+retention_days = 30            # runtime / gateway 按日文件保留天数
+interaction_retention_days = 7 # 交互日志保留天数
+max_total_mb = 500             # logs/ + gateway/ 总量上限，超出从最旧的交互日志开始删
 
 [optimizer]
 enabled = true
@@ -166,6 +209,40 @@ model = "claude-sonnet-4-5"
 profile = "strict"
 ```
 
+## MCP 工具
+
+内置扩展 `src/markbot/extensions/mcp/` 会把 MCP server 的能力映射成普通工具，模型看到的名字是
+`mcp_<server>_<tool>`。需要先安装可选依赖：
+
+```bash
+pip install -e ".[mcp]"
+```
+
+```toml
+[tools.mcp_servers.filesystem]          # stdio：本地进程
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-filesystem", "/path/to/dir"]
+enabled_tools = ["*"]                   # ["*"] = 工具 + 资源 + 提示；指定名单时只注册这些工具
+tool_timeout = 30                       # 单次调用超时（秒）
+connect_timeout = 20
+
+[tools.mcp_servers.remote]              # 远端：type 留空时按 URL 推断 sse / streamableHttp
+url = "https://example.com/mcp"
+headers = { Authorization = "Bearer ${MCP_TOKEN}" }   # ${VAR} 从进程环境变量展开
+```
+
+行为约定：
+
+- `type` 支持 `stdio` / `sse` / `streamableHttp`，留空按 `command` / `url` 推断。
+- 工具名只保留 `[A-Za-z0-9_-]`，超过 64 字符追加哈希后缀；重名时先注册者生效并记录冲突。
+- 参数契约使用服务端下发的 JSON Schema，客户端只做 provider 兼容化（本地 `$ref` 提升、`nullable` 归一）。
+- 声明了 `readOnlyHint` / `idempotentHint` 的工具在瞬态错误后最多重试一次；有副作用的调用
+  发出后若连接中断或超时，返回「结果未知」且**不会重放**，避免重复副作用。
+- 会话中断会按 server 粒度自动重连；单个 server 连不上只记 warning 并跳过，不影响其它能力。
+- MCP 连接由扩展私有的事件循环线程持有，跨回合复用，并在 `markbot` 退出时关闭。
+- 服务端 URL 写入日志前会去掉凭据、路径细节与查询串。
+- MCP 返回的图片/二进制资源只给出占位说明，不会把 base64 塞进模型上下文。
+
 ## 权限与信任
 
 ### 权限档位
@@ -176,7 +253,18 @@ profile = "strict"
 | `standard` | 允许能力内 | 需确认 | 需确认 | 允许能力内 | 允许 |
 | `trusted` | 允许能力内 | 允许能力内 | 允许能力内 | 允许能力内 | 允许 |
 
-`strict` 拒绝写/执行/网络/密钥；`standard` 对写与执行逐次确认；`trusted` 跳过逐次确认（`confirm_on_write` / `confirm_on_exec` 失效），但仍受能力清单与路径边界约束。路径越界一律拒绝；能力声明语法：
+`strict` 拒绝写/执行/网络/密钥；`standard` 对写与执行逐次确认；`trusted` 跳过写入确认，执行命令时默认只有放行名单内的命令免确认（`trusted_exec = "listed"`；设为 `"all"` 恢复全部免确认），仍受能力清单与路径边界约束。
+
+无论档位与名单如何，以下命令**总是**需要确认：内联解释器（`python -c`、`node -e`…）、
+shell 与提权（`sh`/`bash`/`eval`/`sudo`…）、命令替换（`$()`、反引号）、解码管道（`base64 -d`…）。
+放行名单会检查命令中的**每一个**程序，`allow_commands` 只匹配不含 `; | & > <` 的单条命令。
+
+命令扫描只能识别字面路径。需要内核级保证时开启（仅 macOS）：
+
+```toml
+[permissions]
+os_sandbox = "macos"   # 命令经 sandbox-exec 执行，受保护目录（home、学习层、配置）禁止读写
+```路径越界一律拒绝；能力声明语法：
 
 ```text
 fs.read:<glob>   fs.write:<glob>   net:<host|*>   exec:<program|*>   secret:<name>   ui
@@ -228,18 +316,30 @@ markbot trust office --revoke
 └── trust.json
 ```
 
-会话归档对齐 Harness² 的 task 结构：
+会话归档的 task 结构：
 
 ```text
 sessions/<session_id>/
 ├── meta.json          # 时间、领域、状态、步数、工具调用数
 ├── request.md         # 原始请求（已脱敏）
 ├── files/             # 输入附件快照
-├── trajectory.jsonl   # 完整轨迹（已脱敏，压缩后为摘要锚点 + 近期原文）
-├── compacted.jsonl    # 可选：被压缩掉的原始消息（审计用）
+├── events.jsonl       # 唯一事实来源：append-only 事件日志（已脱敏，含压缩移除的原文）
 ├── deliverable/       # 最终产出 final.md
 └── feedback.json      # 可选：用户反馈
 ```
+
+「轨迹」（当前上下文投影）与「压缩段」（每次压缩移除的原文）都从 `events.jsonl` 派生，
+代码里统一用 `markbot.schema.session_log.SessionLog(dir).trajectory()` / `.compacted()` 读取。
+旧版本额外写的 `trajectory.jsonl` / `compacted.jsonl` 默认不再生成（ADR 0007）；
+外部脚本还要读它们时，在 `config.toml` 里打开：
+
+```toml
+[sessions]
+legacy_views = true
+```
+
+升级后运行 `markbot sessions status` 查看占用，`markbot sessions migrate --dry-run` 预览清理。
+迁移会逐条比对事件投影与旧文件，一致才删除；老归档里只存在于 `compacted.jsonl` 的压缩原文会保留。
 
 ## 日志与排查
 
@@ -297,6 +397,19 @@ def setup(api):
 
 注册先写入暂存区，`setup` 成功后一次性提交；失败只丢弃该扩展。
 
+声明了 `fs.*` / `net:<host>` 能力的工具，要标注哪个参数是路径/URL，权限检查才不会落空
+（未标注且参数名不在兜底名单里时，加载会给出警告）：
+
+```python
+class CopyIn(BaseModel):
+    source: str = Field(json_schema_extra={"x-markbot-role": "path"})
+    endpoint: str = Field(json_schema_extra={"x-markbot-role": "url"})
+
+# 或者：Tool(..., arg_roles={"source": "path", "endpoint": "url"})
+```
+
+角色有 `path` / `url` / `command` / `program`；发给模型的 schema 会去掉这个标注。
+
 ### B. 技能
 
 ```text
@@ -342,7 +455,9 @@ prompts = ["./prompts/*.md"]
 
 ### D. 学习层
 
-优化器只能写 `~/.markbot/learned/` 与 `~/.markbot/strategy/` 相关目录。结构：
+`learned/` 的写入方：优化器（晋升/回滚）、记忆整理（Dream）、记忆工具（remember/forget）、
+`markbot memory restore`。它们共用一把跨进程学习层写锁（`<home>/.learned.lock`）；优化器晋升时
+若 `learned/` 在评估期间被写过，会放弃本次晋升而不是覆盖新记忆。快照按内容去重。结构：
 
 ```text
 learned/
@@ -366,12 +481,19 @@ markbot rollback --to <hash>   # 回滚到指定快照
 markbot rollback               # 回滚到最新快照
 ```
 
-门禁四条件（任一不满足即拒绝）：
+门禁条件（任一不满足即拒绝）：
 
-1. 候选必须真的发生变化；
-2. 只允许写 `learned/` 白名单路径；
-3. 不得引入新的能力声明；
-4. 回归集不得掉分。
+1. 回归集至少 `min_eval_cases` 条（默认 10，`evals/cases/` 现有 14 条）；
+2. 候选必须真的发生变化；
+3. 只允许写 `learned/` 白名单路径；
+4. 不得引入新的能力声明；
+5. 回归集不得掉分（`contains` / `not_contains` / `regex`；`[optimizer] llm_judge = true` 时
+   `llm_judge` 检查由当前模型按 rubric 判 PASS/FAIL）；
+6. 新增或修改技能（`skills/**`）的候选不自动晋升，保存到 `~/.markbot/optimizer/pending/`，
+   确认后用 `markbot optimize --approve-skills`；
+7. 评估期间 `learned/` 被其它写入方修改过则放弃晋升（ADR 0005）。
+
+候选里不会写入会话原文（用户请求只用于生成候选，不进入系统提示或技能正文）。
 
 候选被拒绝时保存在 `~/.markbot/optimizer/rejected/`，每轮审计写入 `~/.markbot/logs/optimizer.jsonl`。
 
@@ -379,6 +501,15 @@ markbot rollback               # 回滚到最新快照
 
 ```bash
 markbot serve --host 127.0.0.1 --port 8787
+```
+
+所有 `POST` 必须带 `X-MarkBot-Token` 头，令牌在 `~/.markbot/gateway/auth.token`（0600，首次启动生成，
+渠道与定时任务自动读取）。`confirm_hook` / `notify_hook` 只接受回环地址；`grants` 只接受程序名。
+监听非回环地址需要显式加 `--allow-remote`（请放在反向代理/防火墙之后）。
+
+```bash
+curl -s -H "X-MarkBot-Token: $(cat ~/.markbot/gateway/auth.token)" \
+  -d '{"prompt":"你好"}' http://127.0.0.1:8787/chat
 ```
 
 | 接口 | 说明 |
@@ -393,11 +524,16 @@ markbot serve --host 127.0.0.1 --port 8787
 
 同一 Kernel 可同时服务 CLI 与 HTTP 入口。
 
+并发：不同会话的请求并发执行（上限 `[agent] max_concurrent_turns`），同一会话串行；
+运行时重载、记忆整理、空闲归档以独占方式执行（等在途回合结束）。确认 UI 与 `/allow`
+授权只对本回合生效，并发会话之间互不影响（ADR 0005）。`GET /health` 返回 `turns` 统计。
+
 ## 测试与质量门禁
 
 ```bash
 pytest                       # 单元测试
-ruff check src tests         # 代码检查
+ruff check src tests         # 代码检查（阻断）
+bash scripts/lint_strict.sh  # 更严格的 ruff B/UP/SIM/RUF + pyright（棘轮：只许减少）
 markbot selftest             # 依赖方向 + 运行时视图 + Agent Loop
 markbot selftest --inject-failure office
 markbot doctor --validate
@@ -420,4 +556,6 @@ cli 依赖 kernel + optimizer
 - 密钥通过 `ctx.secret(name)` 在工具边界使用，不进入模型上下文；归档前对密钥形状字符串做脱敏。
 - 写文件、执行命令遵循确认策略；命令在受限环境变量与工作目录中执行，并带超时强杀。
 - 第三方扩展与包必须通过能力清单与信任校验；加载或执行失败只影响自身。
-- 第一版不追求强隔离（容器化是可选增强），不可信代码建议放进容器或低权限用户运行。
+- 命令执行是「进程隔离 + 路径约定 + 静态扫描」，不是完整沙箱；macOS 可开 `os_sandbox = "macos"`
+  获得受保护目录的内核级隔离。不可信代码仍建议放进容器或低权限用户运行。
+- 内部 HTTP（serve ↔ 渠道 ↔ 定时任务）用本机令牌鉴权，回调地址限制为回环地址（ADR 0004）。

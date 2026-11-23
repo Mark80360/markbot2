@@ -16,7 +16,10 @@ _SCHEME = re.compile(r"^https?://", re.IGNORECASE)
 
 
 class FetchIn(BaseModel):
-    url: str = Field(description="http/https 地址；省略协议头时按 http:// 处理")
+    url: str = Field(
+        description="http/https 地址；省略协议头时按 http:// 处理",
+        json_schema_extra={"x-markbot-role": "url"},
+    )
     max_chars: int = Field(default=20000, ge=100, le=200000)
     timeout_s: float = Field(default=30.0, ge=1, le=120)
     verify_tls: bool = Field(

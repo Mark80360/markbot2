@@ -12,6 +12,8 @@ import threading
 from datetime import datetime
 from pathlib import Path
 
+from markbot.api.redaction import redact_secrets
+
 _LOCK = threading.Lock()
 _INSTALLED: set[Path] = set()
 
@@ -33,9 +35,6 @@ def write(home: Path, message: str) -> None:
     """
     path = gateway_log_path(home)
     stamp = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S")
-    # 延迟导入：gateway_log 在包初始化早期就会被加载，避开循环导入
-    from markbot.kernel.session import redact_secrets
-
     line = f"[{stamp}] {redact_secrets(message)}\n"
     try:
         with _LOCK:

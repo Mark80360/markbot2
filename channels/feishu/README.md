@@ -24,11 +24,23 @@ host = "0.0.0.0"
 path = "/feishu/event"
 markbot_url = "http://127.0.0.1:8787"    # markbot serve 地址
 markbot_timeout_s = 300
-require_mention = true                   # 群聊必须 @ 机器人才响应
+group_policy = "mention"                 # mention（群聊必须 @）| open（群聊全部响应）
+streaming = true                         # 用 CardKit 流式卡片展示模型输出
 # session_db = "~/.markbot/channels/feishu/feishu.db"
+# media_dir = "~/.markbot/media/feishu"
+
+# 入站语音转写（可选）：默认追随 Groq/OpenAI 的 OpenAI 兼容接口
+[transcription]
+enabled = true
+provider = "groq"                        # groq | openai
+# model = "whisper-large-v3"             # 留空按 provider 选默认
+# api_base = "https://api.groq.com/openai/v1"
+# language = "zh"
+# max_upload_mb = 25
 
 [secrets]
 FEISHU_APP_SECRET = "xxxxxxxx"
+TRANSCRIPTION_API_KEY = "xxxxxxxx"       # 也可用环境变量 GROQ_API_KEY / OPENAI_API_KEY
 ```
 
 说明：
@@ -42,7 +54,8 @@ FEISHU_APP_SECRET = "xxxxxxxx"
 
 1. 在[飞书开放平台](https://open.feishu.cn/)创建企业自建应用
 2. 开启「机器人」能力
-3. 权限：至少 `im:message`（接收消息）、`im:message:send_as_bot`（发送消息）
+3. 权限：至少 `im:message`（接收消息）、`im:message:send_as_bot`（发送消息）、
+   `im:resource`（下载入站图片/文件、上传出站媒体）、`cardkit:card:write`（流式卡片）
 4. 事件订阅：
    - `mode = "longconn"`：订阅方式选「**使用长连接接收事件**」，无需请求地址
    - `mode = "webhook"`：订阅方式选「将事件发送至开发者服务器」，请求地址填 `https://你的域名/feishu/event`
@@ -87,17 +100,22 @@ markbot gateway stop       # 停止
 ## 4. 行为说明
 
 - 每个飞书群对应一个 MarkBot 会话，私聊按 chat 独立；重启后通过 SQLite 恢复映射
-- 群聊默认只处理 @ 机器人的消息，可在配置里关闭 `require_mention`
+- 群聊默认只处理 @ 机器人的消息，可把 `group_policy` 改为 `open`
 - 支持 `/new`（开始新会话）与 `/session`（查看当前会话 id）
 - 按 `header.event_id` 去重，飞书重试不会重复触发
-- 回复按 3500 字分片发送
+- 支持文本、富文本（post）、卡片（interactive）与分享卡片；入站图片/文件/音视频下载后把路径写进提示词
+- 入站语音会调用 `/audio/transcriptions` 转写，转写结果随提示词一起交给 agent（需配置 `[transcription]`）
+- 回复按 3500 字分片发送；Markdown 较复杂时改发卡片，卡片失败回退纯文本
+- 模型输出默认通过 CardKit 流式卡片渐进展示；失败自动回退普通消息
+- 出站媒体：`/chat` 结果里的 `media` 列表，以及回复 Markdown 中指向本地已存在文件的图片/链接，
+  会按扩展名以图片、语音、视频或文件消息发送
 - 模型处理放后台单工作线程，webhook 立即返回 200，避免飞书 3 秒超时重试
 
 ## 5. 已知限制
 
-- 只处理文本消息，图片/文件/富文本暂不解析
+- 流式展示只覆盖模型第一轮文本；工具调用后的最终答复会替换卡片内容
+- 出站媒体需要本地文件真实存在；相对路径按渠道进程工作目录与 `~/.markbot` 解析
 - webhook 模式未实现事件加密（AES）；若后台开启了 Encrypt Key，请关闭或改用 `longconn`（加密由飞书 SDK 处理）
-- 不支持流式输出与消息编辑
 - 单工作线程串行处理：MarkBot 的 `/chat` 本身是串行的，多群高并发时建议先限制入口速率
 - 渠道自身日志输出到 stdout；MarkBot 侧日志仍在 `~/.markbot/logs/`
 
@@ -106,3 +124,24 @@ markbot gateway stop       # 停止
 - `config.toml` 含密钥，注意文件权限，不要提交到仓库
 - 生产环境建议只监听内网/回环，由反向代理负责 HTTPS 与限流
 - 不用的权限不要勾选；`app_secret` 定期轮换
+
+## 代码结构
+
+入口仍是 `channel.py`（`markbot gateway start` 会启动它）；其余为同级模块，部署时整个目录一起拷贝：
+
+| 文件 | 职责 |
+|---|---|
+| `channel.py` | 入口：回调 HTTP 服务、长连接、`--check`、`main` |
+| `feishu_common.py` | 常量、日志、MarkBot home、本机令牌 |
+| `feishu_settings.py` | 读取 `config.toml` + `secrets.toml` |
+| `feishu_store.py` | SQLite：消息去重、会话映射、`/allow` 授权 |
+| `feishu_client.py` | 飞书开放平台 API 客户端 |
+| `feishu_parse.py` | 入站消息解析（纯函数） |
+| `feishu_render.py` | 出站 Markdown / 卡片渲染（纯函数） |
+| `feishu_gateway.py` | 消息处理、聊天内确认、调用 MarkBot |
+
+## 并发
+
+`[channels.feishu] workers = 4`（默认，上限 16）：消息按 `chat_id` 分到多个处理线程，不同聊天并行，
+同一聊天严格按顺序处理。服务端的总并发仍由 `[agent] max_concurrent_turns` 控制。
+

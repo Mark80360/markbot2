@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
@@ -100,6 +101,29 @@ def score_text(text: str, case: EvalCase) -> Score:
     return score
 
 
+async def score_case(text: str, case: EvalCase, judge: Judge | None = None) -> Score:
+    """确定性检查 + 可选的 ``llm_judge``（按 rubric 判定通过与否）。"""
+    score = score_text(text, case)
+    if judge is None:
+        return score
+    for check in case.checks:
+        if check.type != "llm_judge":
+            continue
+        rubric = check.rubric or check.value
+        score.total += 1
+        try:
+            verdict = judge(text, rubric)
+            if inspect.isawaitable(verdict):
+                verdict = await verdict
+            ok = bool(verdict)
+        except Exception as exc:  # noqa: BLE001 - 判分失败按不通过计，并留下原因
+            ok = False
+            score.details.append(f"{case.id}:llm_judge_error={exc}")
+        score.passed += int(ok)
+        score.details.append(f"{case.id}:llm_judge={ok}")
+    return score
+
+
 class EvalSuite:
     """把「用某个 harness 跑一条用例」的职责留给调用方。"""
 
@@ -123,7 +147,7 @@ class EvalSuite:
                 total.total += len(case.checks)
                 total.details.append(f"{case.id}: error={exc}")
                 continue
-            partial = score_text(text, case)
+            partial = await score_case(text, case, self.judge)
             total.passed += partial.passed
             total.total += partial.total
             total.details.extend(partial.details)
@@ -134,4 +158,13 @@ def case_files(case: EvalCase, base: Path) -> list[Path]:
     return [base / rel for rel in case.files]
 
 
-__all__ = ["Check", "EvalCase", "EvalSuite", "Score", "case_files", "load_cases", "score_text"]
+__all__ = [
+    "Check",
+    "EvalCase",
+    "EvalSuite",
+    "Score",
+    "case_files",
+    "load_cases",
+    "score_case",
+    "score_text",
+]

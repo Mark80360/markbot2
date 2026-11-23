@@ -1,6 +1,6 @@
 """离线整理器（nanobot Dream 的等价物）。
 
-数据流：``sessions/*/trajectory.jsonl`` + ``compacted.jsonl`` -> 模型产出候选事实
+数据流：``sessions/*/events.jsonl``（经 ``SessionLog`` 投影为轨迹与压缩段）-> 模型产出候选事实
 （纯 JSON）-> ``MemoryStore`` 写入。模型拿不到任何工具，也不接触文件系统，
 所有落盘都经过 store 的白名单、容量检查与写后校验，因此不可能越界写
 ``sessions/`` 或 ``config.toml``。
@@ -24,6 +24,7 @@ from typing import Any
 from markbot.memory.journal import Journal, SessionBatch, load_cursor, save_cursor
 from markbot.memory.lifespan import LIFESPANS, split_meta, status
 from markbot.memory.store import INDEX_REL, RESIDENT_REL, MemoryStore, _atomic_write
+from markbot.schema.locking import learned_write_lock
 
 _logger = logging.getLogger("markbot.memory")
 
@@ -128,8 +129,8 @@ class Consolidator:
             _logger.info("记忆整理完成 written=0 sessions=%d", len(batches))
             return ConsolidateReport(sessions=len(batches), cursor_advanced=True)
 
-        # 模型调用不占锁；只有落盘/回滚阶段与聊天串行
-        with self._apply_guard():
+        # 模型调用不占锁；只有落盘/回滚阶段与聊天串行，并与其它进程的学习层写入互斥
+        with self._apply_guard(), learned_write_lock(self.store.root):
             snapshot = self._snapshot()
             self._write_plan(batches, candidates)
             report = ConsolidateReport(sessions=len(batches))
@@ -248,22 +249,24 @@ class Consolidator:
 
     def _snapshot(self) -> dict[str, str | None]:
         files: dict[str, str | None] = {}
-        base = self.home / "memory" / "snapshots" / _stamp() / "learned"
         for rel in self._memory_rels():
             path = self.store.root / rel
             try:
-                text = path.read_text(encoding="utf-8")
+                files[rel] = path.read_text(encoding="utf-8")
             except FileNotFoundError:
                 files[rel] = None
-                continue
             except OSError as exc:
                 _logger.warning("记忆快照读取失败 path=%s error=%s", rel, exc)
-                continue
-            files[rel] = text
-            dest = base / rel
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            dest.write_text(text, encoding="utf-8")
-        _prune(self.home / "memory" / "snapshots", SNAPSHOT_KEEP)
+        present = {rel: text for rel, text in files.items() if text is not None}
+        root = self.home / "memory" / "snapshots"
+        # 内容与最近一份快照完全相同就不再落盘：旧实现每轮整理都复制一整份 learned/
+        if present and present != _latest_snapshot_files(root):
+            base = root / _stamp() / "learned"
+            for rel, text in present.items():
+                dest = base / rel
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                dest.write_text(text, encoding="utf-8")
+            _prune(root, SNAPSHOT_KEEP)
         return files
 
     def _restore(self, files: dict[str, str | None]) -> None:
@@ -298,6 +301,15 @@ def restore_snapshot(
     home: Path, learned_dir: Path, name: str | None = None, *, dry_run: bool = False
 ) -> list[str]:
     """用快照覆盖记忆文件；``dry_run`` 只返回将被改动的相对路径。"""
+    if dry_run:
+        return _restore_snapshot(home, learned_dir, name, dry_run=True)
+    with learned_write_lock(Path(learned_dir)):
+        return _restore_snapshot(home, learned_dir, name, dry_run=False)
+
+
+def _restore_snapshot(
+    home: Path, learned_dir: Path, name: str | None, *, dry_run: bool
+) -> list[str]:
     root = Path(home) / "memory" / "snapshots"
     names = list_snapshots(home)
     if not names:
@@ -424,6 +436,25 @@ def _stamp() -> str:
 
 def _now() -> str:
     return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def _latest_snapshot_files(root: Path) -> dict[str, str] | None:
+    names = sorted(
+        path.name for path in root.iterdir() if path.is_dir() and path.name != "staging"
+    ) if root.exists() else []
+    if not names:
+        return None
+    base = root / names[-1] / "learned"
+    if not base.exists():
+        return None
+    out: dict[str, str] = {}
+    for path in sorted(base.rglob("*")):
+        if path.is_file():
+            try:
+                out[path.relative_to(base).as_posix()] = path.read_text(encoding="utf-8")
+            except OSError:
+                return None
+    return out
 
 
 def _prune(root: Path, keep: int) -> None:

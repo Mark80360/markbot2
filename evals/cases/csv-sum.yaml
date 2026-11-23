@@ -1,0 +1,8 @@
+id: csv-sum
+domain: office
+prompt: 读取 fixtures/sales.csv，计算 amount 列的总和，只回复数字结果。
+files:
+  - fixtures/sales.csv
+checks:
+  - type: regex
+    value: "\\b600\\b"

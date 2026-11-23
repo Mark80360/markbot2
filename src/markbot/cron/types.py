@@ -125,15 +125,17 @@ class CronRun:
     error: str = ""
     response: str = ""
 
-    def to_dict(self) -> dict[str, Any]:
-        return {
+    def to_dict(self, *, include_response: bool = True) -> dict[str, Any]:
+        data = {
             "run_id": self.run_id,
             "started_at_ms": self.started_at_ms,
             "finished_at_ms": self.finished_at_ms,
             "status": self.status,
             "error": self.error,
-            "response": self.response,
         }
+        if include_response:
+            data["response"] = self.response
+        return data
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "CronRun":
@@ -161,7 +163,8 @@ class CronJobState:
             "last_run_at_ms": self.last_run_at_ms,
             "last_status": self.last_status,
             "last_error": self.last_error,
-            "history": [run.to_dict() for run in self.history],
+            # 历史里不落 response（正文另存 runs/<job_id>/<run_id>.json），避免 jobs.json 无限膨胀
+            "history": [run.to_dict(include_response=False) for run in self.history],
         }
 
     @classmethod

@@ -9,6 +9,7 @@ from typing import Any, Protocol
 
 from markbot.optimizer.gate import illegal_paths
 from markbot.schema.models import SessionMeta
+from markbot.schema.session_log import SessionLog
 
 
 @dataclass(frozen=True)
@@ -60,16 +61,8 @@ class SessionStore:
         return rows[:limit] if limit else rows
 
     def trajectory(self, task_id: str) -> list[dict[str, Any]]:
-        path = self.path(task_id, "trajectory.jsonl")
-        if not path.exists():
-            return []
-        rows: list[dict[str, Any]] = []
-        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
-            try:
-                rows.append(json.loads(line))
-            except ValueError:
-                continue
-        return rows
+        """会话轨迹：从 events.jsonl 投影；旧归档回退 trajectory.jsonl（ADR 0007）。"""
+        return SessionLog(self.root / task_id).trajectory()
 
 
 class AssistantAdapter:

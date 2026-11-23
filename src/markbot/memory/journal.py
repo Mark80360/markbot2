@@ -1,8 +1,8 @@
 """跨会话历史检索：直接扫描内核归档，不复制第二份事实。
 
-事实来源是 ``~/.markbot/sessions/<id>/trajectory.jsonl`` 与
-``compacted.jsonl``；检索只返回 ``session_id + 行号 + 片段``，正文让模型用
-``read_file`` 精读。
+事实来源是 ``~/.markbot/sessions/<id>/events.jsonl``，经 ``schema.session_log.SessionLog``
+投影成「轨迹」与「压缩段」两个视图（旧归档没有事件日志时回退读 ``trajectory.jsonl`` /
+``compacted.jsonl``）。检索只返回 ``session_id + 视图名 + 序号 + 片段``。
 
 整理游标放在运行时私有目录 ``~/.markbot/memory/cursor.json``，不进入
 ``learned/``，避免污染 ``tree_hash`` 与晋升评估。
@@ -17,6 +17,9 @@ import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
+
+from markbot.api.redaction import redact_secrets
+from markbot.schema.session_log import SessionLog
 
 _logger = logging.getLogger("markbot.memory")
 
@@ -134,8 +137,8 @@ class Journal:
             return []
         hits: list[JournalHit] = []
         for directory in self._session_dirs():
-            for source, path in self._files(directory):
-                for number, row in _rows(path):
+            for source, rows in self._views(directory):
+                for number, row in rows:
                     text = _row_text(row)
                     if not text or not any(term in text.lower() for term in terms):
                         continue
@@ -185,9 +188,9 @@ class Journal:
         lines: list[str] = []
         used = 0
         # 优先 compacted：其中是被压缩掉的原文，信息密度更高
-        for source, path in reversed(self._files(directory)):
-            for _, row in _rows(path):
-                text = _row_text(row)
+        for source, rows in reversed(self._views(directory)):
+            for _, row in rows:
+                text = redact_secrets(_row_text(row))
                 if not text:
                     continue
                 role = str(row.get("role") or source)
@@ -207,23 +210,25 @@ class Journal:
         dirs.sort(key=_mtime, reverse=True)
         return dirs
 
-    def _files(self, directory: Path) -> list[tuple[str, Path]]:
-        files: list[tuple[str, Path]] = []
-        for name in ("trajectory.jsonl", "compacted.jsonl"):
-            path = directory / name
-            if path.is_file():
-                files.append((name.split(".")[0], path))
-        return files
+    def _views(self, directory: Path) -> list[tuple[str, list[tuple[int, dict[str, Any]]]]]:
+        """``[("trajectory", rows), ("compacted", rows)]``；序号从 1 开始，空视图省略。"""
+        log = SessionLog(directory)
+        views: list[tuple[str, list[tuple[int, dict[str, Any]]]]] = []
+        for source, rows in (("trajectory", log.trajectory()), ("compacted", log.compacted())):
+            if rows:
+                views.append((source, list(enumerate(rows, start=1))))
+        return views
 
     def _counts(self, directory: Path) -> tuple[int, int] | None:
-        trajectory = directory / "trajectory.jsonl"
-        if not trajectory.is_file():
+        # 只整理已经归档过的会话：长驻会话的 events.jsonl 实时追加，没归档前不进入整理，
+        # 与旧行为一致。归档的标志是 meta.json；旧归档只有 trajectory.jsonl（也是归档时写的）
+        if not ((directory / "meta.json").is_file() or (directory / "trajectory.jsonl").is_file()):
             return None
-        messages = _row_count(trajectory)
+        log = SessionLog(directory)
+        messages = len(log.trajectory())
         if messages <= 0:
             return None
-        compacted = directory / "compacted.jsonl"
-        return messages, _row_count(compacted) if compacted.is_file() else 0
+        return messages, len(log.compacted())
 
 
 def _mtime(path: Path) -> float:

@@ -1,0 +1,10 @@
+id: json-field
+domain: code
+prompt: 读取 fixtures/user.json，告诉我 name 字段的值和 roles 的个数。
+files:
+  - fixtures/user.json
+checks:
+  - type: contains
+    value: Alice-Markbot
+  - type: regex
+    value: "\\b2\\b|两|二"

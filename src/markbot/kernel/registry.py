@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import sys
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
@@ -17,6 +18,7 @@ from markbot.kernel.permissions import (
     Capability,
     CapabilityError,
     parse_capabilities,
+    unchecked_capabilities,
     uncovered_capabilities,
 )
 from markbot.kernel.runtime_view import (
@@ -78,11 +80,13 @@ class StagedExtensionAPI:
         source: SourceSet,
         ui: UI,
         ceiling: list[Capability] | None = None,
+        config: Mapping[str, Any] | None = None,
     ) -> None:
         self.id = ext_id
         self._source = source
         self._ui = ui
         self._ceiling = ceiling
+        self.config: Mapping[str, Any] = config or {}
         self._tools: list[Tool] = []
         self._commands: list[Command] = []
         self._providers: list[Any] = []
@@ -107,6 +111,14 @@ class StagedExtensionAPI:
                 raise CapabilityError(
                     f"工具 {tool.name} 声明了包能力之外的能力: {', '.join(missing)}"
                 )
+        unchecked = unchecked_capabilities(tool)
+        if unchecked:
+            # 不拒绝加载（兼容旧扩展），但权限检查对这些能力会落空：提示作者声明参数角色
+            self._source.warnings.append(
+                f"工具 {tool.name} 声明了 {', '.join(unchecked)}，但参数里没有可识别的"
+                "路径/URL 字段；请用 Field(json_schema_extra={'x-markbot-role': 'path'|'url'})"
+                " 或 Tool(arg_roles=...) 标注"
+            )
         self._tools.append(tool)
 
     def register_command(self, name: str, description: str, handler) -> None:
@@ -159,8 +171,9 @@ def load_extension(
     source: SourceSet,
     ui: UI,
     ceiling: list[Capability] | None = None,
+    config: Mapping[str, Any] | None = None,
 ) -> bool:
-    api = StagedExtensionAPI(ext_id, source=source, ui=ui, ceiling=ceiling)
+    api = StagedExtensionAPI(ext_id, source=source, ui=ui, ceiling=ceiling, config=config)
     try:
         module = _import_from_path(Path(path))
         setup = getattr(module, "setup", None)
@@ -187,6 +200,7 @@ def load_extensions_from_dir(
     source: SourceSet,
     ui: UI,
     ceiling: list[Capability] | None = None,
+    config: Mapping[str, Any] | None = None,
 ) -> None:
     directory = Path(directory)
     if not directory.exists():
@@ -201,7 +215,14 @@ def load_extensions_from_dir(
             candidates.append(child)
     for candidate in candidates:
         ext_id = f"{source.origin}:{candidate.stem}"
-        load_extension(candidate, ext_id=ext_id, source=source, ui=ui, ceiling=ceiling)
+        load_extension(
+            candidate,
+            ext_id=ext_id,
+            source=source,
+            ui=ui,
+            ceiling=ceiling,
+            config=config,
+        )
 
 
 def is_convention_package(directory: Path) -> bool:
@@ -316,16 +337,24 @@ class RuntimeAssembler:
             ),
         )
         extensions = Path(__file__).resolve().parents[1] / "extensions"
-        load_extensions_from_dir(extensions, source=source, ui=self.ui)
+        load_extensions_from_dir(
+            extensions,
+            source=source,
+            ui=self.ui,
+            config=self._extension_config(),
+        )
         return source
+
+    def _extension_config(self) -> dict[str, Any]:
+        """传给内置扩展的公开配置；密钥只能经 ctx.secret() 获取。"""
+        return {key: value for key, value in self.config.raw.items() if key != "secrets"}
 
     def _learned_source(self) -> SourceSet:
         source = SourceSet(name="learned", origin="learned", priority=PRIORITY_LEARNED)
         strategy_dir = self.learned_dir / "strategy"
         source.strategy = load_strategy_dir(strategy_dir)
-        skills = self.learned_dir / "skills"
-        if skills.exists():
-            source.skill_roots.append(skills)
+        # 目录可能尚未创建：学习层会在运行期写入技能，索引靠目录指纹自动刷新。
+        source.skill_roots.append(self.learned_dir / "skills")
         _load_sub_agents(self.learned_dir, source)
         return source
 
@@ -358,8 +387,8 @@ class RuntimeAssembler:
             name="project", origin="project", priority=PRIORITY_PROJECT, strategy=Strategy()
         )
         load_extensions_from_dir(directory / "extensions", source=source, ui=self.ui)
-        if (directory / "skills").exists():
-            source.skill_roots.append(directory / "skills")
+        # 允许运行期新增项目技能；索引会在目录变化后自动刷新。
+        source.skill_roots.append(directory / "skills")
         return source
 
     def _load_package(self, directory: Path, scope: str) -> SourceSet | None:

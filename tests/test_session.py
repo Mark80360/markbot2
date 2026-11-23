@@ -4,6 +4,7 @@ import asyncio
 import json
 
 from markbot.kernel.session import Session, redact_secrets
+from markbot.schema.session_log import SessionLog, trajectory_text
 
 
 def test_redact_secrets_shapes():
@@ -29,8 +30,10 @@ def test_archive_redacts_and_writes_feedback(tmp_path):
     assert "sk-abcdefghijklmnop1234" not in (target / "meta.json").read_text(
         encoding="utf-8"
     )
-    trajectory = (target / "trajectory.jsonl").read_text(encoding="utf-8")
+    trajectory = trajectory_text(target)
     assert "sk-abcdefghijklmnop1234" not in trajectory
+    # 默认只写事件日志，不再写派生文件（ADR 0007）
+    assert not (target / "trajectory.jsonl").exists()
 
     feedback = json.loads((target / "feedback.json").read_text(encoding="utf-8"))
     assert feedback["rating"] == 5
@@ -57,9 +60,7 @@ def test_archive_handles_quoted_secret_in_tool_arguments(tmp_path):
         ],
     )
     target = session.archive(tmp_path)
-    row = json.loads(
-        (target / "trajectory.jsonl").read_text(encoding="utf-8").splitlines()[1]
-    )
+    row = SessionLog(target).trajectory()[1]
     command = row["tool_calls"][0]["arguments"]["command"]
     assert "abcdefgh12345678" not in command
     assert "[REDACTED]" in command
@@ -70,7 +71,7 @@ def test_archive_idle_writes_snapshot_once_per_activity(make_kernel, home):
     kernel = make_kernel(["收到"])
     asyncio.run(kernel.run("你好", archive=False))
     sid = kernel.session.id
-    trajectory = home / "sessions" / sid / "trajectory.jsonl"
+    trajectory = home / "sessions" / sid / "events.jsonl"
     assert not trajectory.exists()
 
     # 未到阈值、开关关闭：都不动

@@ -2,23 +2,17 @@
 
 from __future__ import annotations
 
-import asyncio
 import json
-import logging
-import time
 from typing import Any
 
-import httpx
-
 from markbot.kernel.providers.base import (
+    DeltaCallback,
     ModelReply,
     ProviderError,
     ToolCall,
-    describe_error,
+    make_tool_call,
 )
-
-_RETRYABLE = (httpx.TransportError, httpx.TimeoutException)
-_logger = logging.getLogger("markbot.provider")
+from markbot.kernel.providers.http import int_items, post_json, sse_event, stream_error, stream_sse
 
 
 class OpenAICompatProvider:
@@ -43,11 +37,14 @@ class OpenAICompatProvider:
         self.max_retries = max_retries
         self.retry_backoff_s = retry_backoff_s
 
-    async def complete(self, payload: dict[str, Any]) -> ModelReply:
+    async def complete(
+        self, payload: dict[str, Any], on_delta: DeltaCallback | None = None
+    ) -> ModelReply:
         body: dict[str, Any] = {
             "model": self.model,
             "messages": _messages(payload),
-            "max_tokens": self.max_tokens,
+            # 探测请求会显式传小 max_tokens，避免为定位被拒内容而生成大段回复
+            "max_tokens": payload.get("max_tokens") or self.max_tokens,
         }
         tools = payload.get("tools") or []
         if tools:
@@ -66,10 +63,24 @@ class OpenAICompatProvider:
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
         }
-        return await _request(
-            self.base_url + "/chat/completions",
+        url = self.base_url + "/chat/completions"
+        if on_delta is None:
+            return await post_json(
+                url,
+                body,
+                headers,
+                parse=_parse,
+                timeout_s=self.timeout_s,
+                max_retries=self.max_retries,
+                backoff_s=self.retry_backoff_s,
+            )
+        body["stream"] = True
+        return await stream_sse(
+            url,
             body,
             headers,
+            new_accumulator=_OpenAIStream,
+            on_delta=on_delta,
             timeout_s=self.timeout_s,
             max_retries=self.max_retries,
             backoff_s=self.retry_backoff_s,
@@ -122,11 +133,11 @@ def _parse(data: dict[str, Any]) -> ModelReply:
     calls: list[ToolCall] = []
     for raw in message.get("tool_calls") or []:
         fn = raw.get("function") or {}
-        try:
-            args = json.loads(fn.get("arguments") or "{}")
-        except ValueError:
-            args = {}
-        calls.append(ToolCall(id=str(raw.get("id") or ""), name=str(fn.get("name") or ""), args=args))
+        calls.append(
+            make_tool_call(
+                str(raw.get("id") or ""), str(fn.get("name") or ""), fn.get("arguments")
+            )
+        )
     usage = data.get("usage") or {}
     return ModelReply(
         text=message.get("content") or "",
@@ -136,71 +147,60 @@ def _parse(data: dict[str, Any]) -> ModelReply:
     )
 
 
-async def _request(
-    url: str,
-    body: dict[str, Any],
-    headers: dict[str, str],
-    *,
-    timeout_s: float,
-    max_retries: int,
-    backoff_s: float,
-) -> ModelReply:
-    """带重试的模型请求：网络错误、超时、429/5xx、响应无法解析都会重试。"""
-    attempts = max(0, max_retries) + 1
-    last_error = "provider 请求失败"
-    for attempt in range(1, attempts + 1):
-        started = time.monotonic()
-        try:
-            async with httpx.AsyncClient(timeout=timeout_s) as client:
-                resp = await client.post(url, json=body, headers=headers)
-        except _RETRYABLE as exc:
-            last_error = describe_error(exc)
-        else:
-            if resp.status_code == 429 or resp.status_code >= 500:
-                last_error = f"provider HTTP {resp.status_code}: {resp.text[:300]}"
-            elif resp.status_code >= 400:
-                _logger.error(
-                    "provider 请求被拒绝 url=%s status=%s 耗时=%.1fs body=%s",
-                    url,
-                    resp.status_code,
-                    time.monotonic() - started,
-                    resp.text[:300],
-                )
-                raise ProviderError(
-                    f"provider HTTP {resp.status_code} url={url}: {resp.text[:300]}"
-                )
-            else:
-                try:
-                    return _parse(resp.json())
-                except (ValueError, ProviderError) as exc:
-                    last_error = describe_error(exc)
+class _OpenAIStream:
+    """累积 Chat Completions 的流式增量：文本、按 index 拼接的工具调用、usage。"""
 
-        elapsed = time.monotonic() - started
-        if attempt >= attempts:
-            _logger.error(
-                "provider 调用失败 url=%s 第 %d/%d 次 耗时=%.1fs 已放弃 错误=%s",
-                url,
-                attempt,
-                attempts,
-                elapsed,
-                last_error,
-            )
-            break
-        delay = backoff_s * (2 ** (attempt - 1))
-        _logger.warning(
-            "provider 调用失败 url=%s 第 %d/%d 次 耗时=%.1fs 将在 %.1fs 后重试 错误=%s",
-            url,
-            attempt,
-            attempts,
-            elapsed,
-            delay,
-            last_error,
-        )
-        if delay > 0:
-            await asyncio.sleep(delay)
-    raise ProviderError(
-        f"{last_error} url={url} 超时设置={timeout_s:.0f}s 已尝试 {attempts} 次"
-    )
+    def __init__(self) -> None:
+        self.text: list[str] = []
+        self.tools: dict[int, dict[str, str]] = {}
+        self.usage: dict[str, int] = {}
+
+    def feed(self, event: dict[str, Any]) -> str | None:
+        if event.get("error"):
+            raise stream_error(event["error"])
+        if event.get("usage"):
+            self.usage.update(int_items(event["usage"]))
+        choices = event.get("choices") or []
+        if not choices:
+            return None
+        delta = choices[0].get("delta") or {}
+        for raw_call in delta.get("tool_calls") or []:
+            try:
+                index = int(raw_call.get("index") or 0)
+            except (TypeError, ValueError):
+                index = 0
+            slot = self.tools.setdefault(index, {"id": "", "name": "", "arguments": ""})
+            if raw_call.get("id"):
+                slot["id"] = str(raw_call["id"])
+            function = raw_call.get("function") or {}
+            if function.get("name"):
+                slot["name"] += str(function["name"])
+            if function.get("arguments"):
+                slot["arguments"] += str(function["arguments"])
+        content = delta.get("content")
+        if isinstance(content, str) and content:
+            self.text.append(content)
+            return content
+        return None
+
+    def result(self) -> ModelReply | None:
+        if not self.text and not self.tools:
+            return None
+        calls = [
+            make_tool_call(slot["id"], slot["name"], slot["arguments"])
+            for _, slot in sorted(self.tools.items())
+        ]
+        return ModelReply(text="".join(self.text), tool_calls=calls, usage=self.usage)
+
+
+# 兼容旧引用
+_stream_event = sse_event
+
+
+
+
+
+
 
 
 __all__ = ["OpenAICompatProvider"]

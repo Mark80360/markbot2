@@ -1,0 +1,8 @@
+id: count-lines
+domain: general
+prompt: fixtures/lines.txt 一共有几行？请读取文件后回答。
+files:
+  - fixtures/lines.txt
+checks:
+  - type: regex
+    value: "\\b5\\b|五"

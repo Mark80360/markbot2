@@ -14,7 +14,11 @@ from pydantic import BaseModel, Field
 
 from markbot.api import ExtensionAPI, Tool, ToolResult
 from markbot.memory.journal import Journal
+from markbot.memory.provider import MemoryProvider
 from markbot.memory.store import MemoryStore
+
+# 与 kernel.context.CONTEXT_PROVIDERS 同值；扩展只依赖 api，不 import kernel
+CONTEXT_PROVIDERS = "context_providers"
 
 _logger = logging.getLogger("markbot.memory")
 MAX_SEARCH_CHARS = 4_000
@@ -90,7 +94,27 @@ def _audit(ctx, level: str, message: str, **fields) -> None:
         logs.runtime_log(level, message, session=_session_id(ctx), **fields)
 
 
+def _context_factory(config):
+    """常驻记忆提供者；``[memory]`` 关闭时沿用默认上限（与旧行为一致：仍注入常驻块）。"""
+    section = dict((config or {}).get("memory") or {})
+    enabled = bool(section.get("enabled", True))
+
+    def factory(learned_dir):
+        if not enabled:
+            return MemoryProvider(learned_dir)
+        return MemoryProvider(
+            learned_dir,
+            resident_limit=int(section.get("resident_max_chars", 6_000)),
+            index_limit=int(section.get("index_max_chars", 2_000)),
+            show_stale=bool(section.get("show_stale", True)),
+        )
+
+    return factory
+
+
 def setup(api: ExtensionAPI) -> None:
+    api.append_entry(CONTEXT_PROVIDERS, _context_factory(getattr(api, "config", None)))
+
     async def remember(ctx, args: RememberIn) -> ToolResult:
         if _memory_off(ctx):
             _logger.info("记忆写入被拒绝 reason=session_off session=%s", _session_id(ctx))

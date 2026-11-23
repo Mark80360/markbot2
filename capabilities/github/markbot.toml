@@ -1,0 +1,14 @@
+[package]
+name = "github"
+version = "0.1.0"
+description = "GitHub 仓库、Issue/PR 与 CI 操作技能（gh CLI）"
+license = "MIT"
+priority = 80
+
+[permissions]
+capabilities = []
+
+[resources]
+extensions = []
+skills = ["."]
+prompts = []

@@ -1,0 +1,10 @@
+id: write-list
+domain: general
+prompt: 创建 notes/todo.md，内容是三行待办：alpha、beta、gamma（每行一个），完成后读回文件确认并告诉我内容。
+checks:
+  - type: contains
+    value: alpha
+  - type: contains
+    value: gamma
+  - type: contains
+    value: todo.md

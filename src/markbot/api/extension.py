@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
@@ -22,6 +22,8 @@ class Command:
 class ExtensionAPI(Protocol):
     version: str
     id: str
+    # 只读的公开配置（不含 [secrets]）；内置扩展据此读取自身小节
+    config: Mapping[str, Any]
 
     def on(self, event: str, handler: Callable[..., Any]) -> Callable[[], None]: ...
 

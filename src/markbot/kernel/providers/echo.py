@@ -5,9 +5,15 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Any
 
-from markbot.kernel.providers.base import ModelReply, ToolCall
+from markbot.kernel.providers.base import DeltaCallback, ModelReply, ToolCall
 
 ReplyLike = ModelReply | str | Callable[[dict[str, Any]], ModelReply]
+
+
+def _emit(text: str, on_delta: DeltaCallback | None) -> ModelReply:
+    if on_delta is not None and text:
+        on_delta(text)
+    return ModelReply(text=text)
 
 
 class EchoProvider:
@@ -18,7 +24,9 @@ class EchoProvider:
     def __init__(self, prefix: str = "[echo] ") -> None:
         self.prefix = prefix
 
-    async def complete(self, payload: dict[str, Any]) -> ModelReply:
+    async def complete(
+        self, payload: dict[str, Any], on_delta: DeltaCallback | None = None
+    ) -> ModelReply:
         messages = payload.get("messages") or []
         last_user = ""
         for msg in reversed(messages):
@@ -27,11 +35,14 @@ class EchoProvider:
                 break
         tool_messages = [m for m in messages if m.get("role") == "tool"]
         if tool_messages:
-            return ModelReply(text=f"{self.prefix}tool result: {tool_messages[-1].get('content', '')}")
+            return _emit(
+                f"{self.prefix}tool result: {tool_messages[-1].get('content', '')}",
+                on_delta,
+            )
         tools = {tool.get("name") for tool in payload.get("tools") or []}
         if "echo" in tools and last_user.startswith("selftest:echo"):
             return ModelReply(tool_calls=[ToolCall(id="call_echo_1", name="echo", args={"text": last_user})])
-        return ModelReply(text=f"{self.prefix}{last_user}")
+        return _emit(f"{self.prefix}{last_user}", on_delta)
 
 
 class ScriptedProvider:
@@ -44,7 +55,9 @@ class ScriptedProvider:
         self.calls: list[dict[str, Any]] = []
         self._last: ModelReply = ModelReply(text="")
 
-    async def complete(self, payload: dict[str, Any]) -> ModelReply:
+    async def complete(
+        self, payload: dict[str, Any], on_delta: DeltaCallback | None = None
+    ) -> ModelReply:
         self.calls.append(payload)
         if self.replies:
             item = self.replies.pop(0)
@@ -54,6 +67,8 @@ class ScriptedProvider:
                 self._last = ModelReply(text=item)
             else:
                 self._last = item(payload)
+        if on_delta is not None and self._last.text:
+            on_delta(self._last.text)
         return self._last
 
 

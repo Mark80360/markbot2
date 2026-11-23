@@ -1,0 +1,11 @@
+id: list-dir
+domain: general
+prompt: 列出 fixtures 目录下的文件名。
+files:
+  - fixtures/hello.txt
+  - fixtures/lines.txt
+checks:
+  - type: contains
+    value: hello.txt
+  - type: contains
+    value: lines.txt

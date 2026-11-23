@@ -2,21 +2,15 @@
 
 from __future__ import annotations
 
-import asyncio
-import logging
-import time
 from typing import Any
 
-import httpx
-
 from markbot.kernel.providers.base import (
+    DeltaCallback,
     ModelReply,
-    ProviderError,
     ToolCall,
-    describe_error,
+    make_tool_call,
 )
-
-_logger = logging.getLogger("markbot.provider")
+from markbot.kernel.providers.http import int_items, post_json, sse_event, stream_error, stream_sse
 
 
 class AnthropicProvider:
@@ -43,10 +37,13 @@ class AnthropicProvider:
         self.retry_backoff_s = retry_backoff_s
         self.version = version
 
-    async def complete(self, payload: dict[str, Any]) -> ModelReply:
+    async def complete(
+        self, payload: dict[str, Any], on_delta: DeltaCallback | None = None
+    ) -> ModelReply:
         body: dict[str, Any] = {
             "model": self.model,
-            "max_tokens": self.max_tokens,
+            # 探测请求会显式传小 max_tokens，避免为定位被拒内容而生成大段回复
+            "max_tokens": payload.get("max_tokens") or self.max_tokens,
             "messages": _messages(payload.get("messages", [])),
         }
         if payload.get("system"):
@@ -66,15 +63,28 @@ class AnthropicProvider:
             "anthropic-version": self.version,
             "Content-Type": "application/json",
         }
-        data = await _request(
-            self.base_url + "/v1/messages",
+        url = self.base_url + "/v1/messages"
+        if on_delta is None:
+            return await post_json(
+                url,
+                body,
+                headers,
+                parse=_parse,
+                timeout_s=self.timeout_s,
+                max_retries=self.max_retries,
+                backoff_s=self.retry_backoff_s,
+            )
+        body["stream"] = True
+        return await stream_sse(
+            url,
             body,
             headers,
+            new_accumulator=_AnthropicStream,
+            on_delta=on_delta,
             timeout_s=self.timeout_s,
             max_retries=self.max_retries,
             backoff_s=self.retry_backoff_s,
         )
-        return _parse(data)
 
 
 def _messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -121,10 +131,10 @@ def _parse(data: dict[str, Any]) -> ModelReply:
             text_parts.append(block.get("text") or "")
         elif block.get("type") == "tool_use":
             calls.append(
-                ToolCall(
-                    id=str(block.get("id") or ""),
-                    name=str(block.get("name") or ""),
-                    args=block.get("input") or {},
+                make_tool_call(
+                    str(block.get("id") or ""),
+                    str(block.get("name") or ""),
+                    block.get("input"),
                 )
             )
     usage = data.get("usage") or {}
@@ -136,71 +146,72 @@ def _parse(data: dict[str, Any]) -> ModelReply:
     )
 
 
-async def _request(
-    url: str,
-    body: dict[str, Any],
-    headers: dict[str, str],
-    *,
-    timeout_s: float,
-    max_retries: int,
-    backoff_s: float,
-) -> dict[str, Any]:
-    """带重试的模型请求：网络错误、超时、429/5xx、响应无法解析都会重试。"""
-    attempts = max(0, max_retries) + 1
-    last_error = "provider 请求失败"
-    for attempt in range(1, attempts + 1):
-        started = time.monotonic()
-        try:
-            async with httpx.AsyncClient(timeout=timeout_s) as client:
-                resp = await client.post(url, json=body, headers=headers)
-        except (httpx.TransportError, httpx.TimeoutException) as exc:
-            last_error = describe_error(exc)
-        else:
-            if resp.status_code == 429 or resp.status_code >= 500:
-                last_error = f"provider HTTP {resp.status_code}: {resp.text[:300]}"
-            elif resp.status_code >= 400:
-                _logger.error(
-                    "provider 请求被拒绝 url=%s status=%s 耗时=%.1fs body=%s",
-                    url,
-                    resp.status_code,
-                    time.monotonic() - started,
-                    resp.text[:300],
-                )
-                raise ProviderError(
-                    f"provider HTTP {resp.status_code} url={url}: {resp.text[:300]}"
-                )
-            else:
-                try:
-                    return resp.json()
-                except ValueError as exc:
-                    last_error = describe_error(exc)
+class _AnthropicStream:
+    """累积 Messages API 的流式事件：text_delta、tool_use 的 input_json_delta、usage。"""
 
-        elapsed = time.monotonic() - started
-        if attempt >= attempts:
-            _logger.error(
-                "provider 调用失败 url=%s 第 %d/%d 次 耗时=%.1fs 已放弃 错误=%s",
-                url,
-                attempt,
-                attempts,
-                elapsed,
-                last_error,
-            )
-            break
-        delay = backoff_s * (2 ** (attempt - 1))
-        _logger.warning(
-            "provider 调用失败 url=%s 第 %d/%d 次 耗时=%.1fs 将在 %.1fs 后重试 错误=%s",
-            url,
-            attempt,
-            attempts,
-            elapsed,
-            delay,
-            last_error,
-        )
-        if delay > 0:
-            await asyncio.sleep(delay)
-    raise ProviderError(
-        f"{last_error} url={url} 超时设置={timeout_s:.0f}s 已尝试 {attempts} 次"
-    )
+    def __init__(self) -> None:
+        self.text: list[str] = []
+        self.tools: dict[int, dict[str, str]] = {}
+        self.usage: dict[str, int] = {}
+
+    @staticmethod
+    def _index(event: dict[str, Any]) -> int:
+        try:
+            return int(event.get("index") or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def feed(self, event: dict[str, Any]) -> str | None:
+        kind = event.get("type")
+        if kind == "error":
+            raise stream_error(event.get("error"))
+        if kind == "message_start":
+            self.usage.update(int_items((event.get("message") or {}).get("usage")))
+        elif kind == "message_delta":
+            self.usage.update(int_items(event.get("usage")))
+        elif kind == "content_block_start":
+            block = event.get("content_block") or {}
+            if block.get("type") == "tool_use":
+                self.tools[self._index(event)] = {
+                    "id": str(block.get("id") or ""),
+                    "name": str(block.get("name") or ""),
+                    "json": "",
+                }
+        elif kind == "content_block_delta":
+            delta = event.get("delta") or {}
+            if delta.get("type") == "text_delta":
+                text = delta.get("text")
+                if isinstance(text, str) and text:
+                    self.text.append(text)
+                    return text
+            elif delta.get("type") == "input_json_delta":
+                slot = self.tools.get(self._index(event))
+                if slot is not None:
+                    slot["json"] += str(delta.get("partial_json") or "")
+        return None
+
+    def result(self) -> ModelReply | None:
+        if not self.text and not self.tools:
+            return None
+        calls = [
+            make_tool_call(slot["id"], slot["name"], slot["json"])
+            for _, slot in sorted(self.tools.items())
+        ]
+        return ModelReply(text="".join(self.text), tool_calls=calls, usage=self.usage)
+
+
+# 兼容旧引用
+_sse_payload = sse_event
+
+
+
+
+
+
+
+
+
+
 
 
 __all__ = ["AnthropicProvider"]

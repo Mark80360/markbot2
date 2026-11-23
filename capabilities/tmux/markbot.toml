@@ -1,0 +1,14 @@
+[package]
+name = "tmux"
+version = "0.1.0"
+description = "交互式终端与 tmux 会话控制技能（含会话查找、等待输出脚本）"
+license = "MIT"
+priority = 80
+
+[permissions]
+capabilities = []
+
+[resources]
+extensions = []
+skills = ["."]
+prompts = []

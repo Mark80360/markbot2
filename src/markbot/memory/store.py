@@ -4,7 +4,7 @@
 - ``strategy/memory.md``：常驻记忆，每轮进入系统提示；
 - ``memory/wiki/<slug>.md`` + ``memory/wiki/index.json``：按需检索的知识页。
 
-每次写入都经过 ``optimizer.gate.allowed_path`` 白名单与容量检查，写后重新读盘
+每次写入都经过 ``schema.learned.allowed_path`` 白名单与容量检查，写后重新读盘
 校验；校验失败会回滚到写入前的文本。日志只记录动作、路径、字符数与校验结果，
 不记录记忆正文。
 """
@@ -20,10 +20,13 @@ import threading
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from functools import wraps
 from pathlib import Path
 
+from markbot.api.redaction import redact_secrets
 from markbot.memory.lifespan import annotate, review_days, split_meta
-from markbot.optimizer.gate import allowed_path
+from markbot.schema.learned import allowed_path
+from markbot.schema.locking import learned_write_lock
 
 _logger = logging.getLogger("markbot.memory")
 
@@ -47,6 +50,17 @@ def _lock_for(path: Path):
         lock = _LOCKS.setdefault(key, threading.Lock())
     with lock:
         yield
+
+
+def _learned_locked(method):
+    """MemoryStore 的写入口：跨进程互斥（与优化器、整理器、回滚共用一把学习层写锁）。"""
+
+    @wraps(method)
+    def wrapper(self, *args, **kwargs):
+        with learned_write_lock(self.root):
+            return method(self, *args, **kwargs)
+
+    return wrapper
 
 
 def _clean_line(line: str) -> str:
@@ -74,6 +88,13 @@ def _slug(topic: str) -> str:
     return slug[:60]
 
 
+def _skill_slug(topic: str) -> str:
+    """技能名遵循 Agent Skills 约定：只保留小写字母、数字与单个短横线。"""
+    slug = _slug(topic).replace("_", "-")
+    slug = re.sub(r"-{2,}", "-", slug).strip("-")
+    return slug[:64]
+
+
 def _short(text: str, limit: int = 120) -> str:
     return text if len(text) <= limit else text[:limit] + "…"
 
@@ -94,6 +115,26 @@ def _new_page(slug: str, title: str, lifespan: str) -> list[str]:
         lines.append(f"review_after: {review}")
     lines.extend(["---", f"# {title}", ""])
     return lines
+
+
+def index_lines(entries: dict, *, today: str | None = None) -> list[str]:
+    """wiki 索引注入上下文时的行格式；写入容量检查与渲染共用，保证两边口径一致。"""
+    today = today or datetime.now().astimezone().date().isoformat()
+    lines: list[str] = []
+    for slug in sorted(entries):
+        entry = entries.get(slug) or {}
+        if not isinstance(entry, dict):
+            continue
+        title = str(entry.get("title") or slug).strip()
+        summary = str(entry.get("summary") or "").strip()
+        review = str(entry.get("review_after") or "")
+        mark = "（待复核）" if review and review <= today else ""
+        lines.append(f"- {slug}{mark}: {summary or title}")
+    return lines
+
+
+def render_index(entries: dict, *, today: str | None = None) -> str:
+    return "\n".join(index_lines(entries, today=today))
 
 
 def _atomic_write(path: Path, text: str) -> None:
@@ -202,6 +243,7 @@ class MemoryStore:
         return self.root / INDEX_REL
 
     # ------------------------------------------------------------------ write
+    @_learned_locked
     def remember(
         self,
         text: str,
@@ -216,9 +258,6 @@ class MemoryStore:
         project_rev: str = "",
         session_id: str = "",
     ) -> Receipt:
-        # 延迟导入：避免 memory -> store -> kernel.session -> kernel.app 的循环依赖
-        from markbot.kernel.session import redact_secrets
-
         fact = _normalize(text)
         if not fact:
             return self._refuse("remember", "内容为空", "", session_id)
@@ -330,9 +369,18 @@ class MemoryStore:
                     "chars": len(new_text),
                 }
                 index_text = self._dump_index(index)
-                if len(index_text) > INDEX_LIMIT:
+                # 容量按「注入上下文的渲染结果」计算，而不是 index.json 的字节数：
+                # JSON 带缩进与 title/日期/来源等元数据，旧口径下 4~5 页就把 2000 字符占满了
+                rendered = len(render_index(index))
+                if rendered > INDEX_LIMIT:
+                    topics = "、".join(sorted(previous)) or "（无）"
                     return self._refuse(
-                        "remember", f"索引超出容量（{len(index_text)}/{INDEX_LIMIT} 字符）", rel, session_id
+                        "remember",
+                        f"记忆索引已满（注入 {rendered}/{INDEX_LIMIT} 字符，{len(previous)} 页）。"
+                        f"不要原样重试：把内容并入已有主题（topic 取其一：{topics}），"
+                        "或先用 memory_forget 删除过期页面",
+                        rel,
+                        session_id,
                     )
 
                 try:
@@ -414,6 +462,7 @@ class MemoryStore:
             chars=len(new_text),
         )
 
+    @_learned_locked
     def forget(self, *, text: str = "", topic: str = "", session_id: str = "") -> Receipt:
         if _normalize(topic):
             return self._forget_wiki(topic, session_id)
@@ -557,8 +606,9 @@ class MemoryStore:
         return hits
 
     def skill_path(self, name: str) -> Path:
-        return self.root / "skills" / _slug(name) / "SKILL.md"
+        return self.root / "skills" / _skill_slug(name) / "SKILL.md"
 
+    @_learned_locked
     def remember_skill(
         self,
         name: str,
@@ -568,11 +618,11 @@ class MemoryStore:
         session_id: str = "",
     ) -> Receipt:
         """写入可复用流程 ``skills/<name>/SKILL.md``（含 description frontmatter）。"""
-        slug = _slug(name)
+        slug = _skill_slug(name)
         rel = f"skills/{slug}/SKILL.md"
         if not allowed_path(rel):
             return self._refuse("skill", f"目标越界: {rel}", rel, session_id)
-        desc = _normalize(description)
+        desc = _normalize(description)[:1024]
         clean_steps = [step for step in (_normalize(item) for item in steps) if step]
         if not desc:
             return self._refuse("skill", "缺少技能描述", rel, session_id)
@@ -740,6 +790,8 @@ class MemoryStore:
 
 __all__ = [
     "INDEX_LIMIT",
+    "index_lines",
+    "render_index",
     "INDEX_REL",
     "MemoryStore",
     "RESIDENT_LIMIT",

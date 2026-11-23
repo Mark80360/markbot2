@@ -7,6 +7,15 @@ import pytest
 from markbot.kernel.app import Kernel
 from markbot.kernel.config import load_config
 from markbot.kernel.providers.echo import ScriptedProvider
+from markbot.kernel.session import clear_registered_secrets
+
+
+@pytest.fixture(autouse=True)
+def _isolate_registered_secrets():
+    """Kernel 启动会把配置里的密钥登记到进程级脱敏表；每个用例前后清空，避免互相影响。"""
+    clear_registered_secrets()
+    yield
+    clear_registered_secrets()
 
 
 @pytest.fixture

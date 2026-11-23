@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pytest
 from pydantic import BaseModel
 
 from markbot.api.tool import Tool, ToolResult
@@ -48,7 +49,9 @@ def test_standard_write_requires_confirmation(tmp_path):
 
 def test_trusted_profile_skips_confirmation(tmp_path):
     policy = PermissionPolicy(
-        PermissionConfig(profile="trusted", confirm_on_write=True, confirm_on_exec=True),
+        PermissionConfig(
+            profile="trusted", confirm_on_write=True, confirm_on_exec=True, allow_exec=["python"]
+        ),
         root=tmp_path,
     )
     write = policy.check(_tool(frozenset({"fs.write:./**"})), {"path": "a.txt"})
@@ -57,6 +60,16 @@ def test_trusted_profile_skips_confirmation(tmp_path):
         _tool(frozenset({"exec:*"}), params=EmptyIn), {"command": "python -V"}
     )
     assert exec_.allowed and not exec_.requires_confirmation
+
+
+def test_trusted_profile_confirms_unlisted_programs_by_default(tmp_path):
+    tool = _tool(frozenset({"exec:*"}), params=EmptyIn)
+    listed = PermissionPolicy(PermissionConfig(profile="trusted"), root=tmp_path)
+    decision = listed.check(tool, {"command": "python -V"})
+    assert decision.allowed and decision.requires_confirmation
+
+    legacy = PermissionPolicy(PermissionConfig(profile="trusted", trusted_exec="all"), root=tmp_path)
+    assert not legacy.check(tool, {"command": "python -V"}).requires_confirmation
 
 
 def test_path_outside_declared_scope_is_denied(tmp_path):
@@ -127,3 +140,57 @@ def test_capability_coverage_and_glob():
     assert uncovered_capabilities(frozenset({"net:*"}), [parent]) == ["net:*"]
     assert glob_match("data/**", "data/a/b.txt")
     assert not glob_match("data/*", "data/a/b.txt")
+
+
+def test_allowlist_checks_every_program_in_command(tmp_path):
+    tool = _tool(frozenset({"exec:*"}), params=EmptyIn)
+    policy = PermissionPolicy(
+        PermissionConfig(
+            profile="standard",
+            allow_exec=["curl"],
+            allow_commands=["curl -s http://127.0.0.1:11235/*"],
+        ),
+        root=tmp_path,
+    )
+    # 只看第一个程序时，后面拼接的命令会一起被放行
+    assert policy.check(tool, {"command": "curl -s http://x/ ; rm -rf ~"}).requires_confirmation
+    assert policy.check(tool, {"command": "curl -s http://x/ && rm -rf ~"}).requires_confirmation
+    assert policy.check(tool, {"command": "curl -s http://x/ | tee out"}).requires_confirmation
+    assert not policy.check(tool, {"command": "curl -s http://x/ | curl -s http://y/"}).requires_confirmation
+
+    prefix_only = PermissionPolicy(
+        PermissionConfig(profile="standard", allow_commands=["curl -s http://127.0.0.1:11235/*"]),
+        root=tmp_path,
+    )
+    assert not prefix_only.check(
+        tool, {"command": "curl -s http://127.0.0.1:11235/health"}
+    ).requires_confirmation
+    assert prefix_only.check(
+        tool, {"command": "curl -s http://127.0.0.1:11235/x; rm -rf ~"}
+    ).requires_confirmation
+
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "python3 -c 'import os; print(open(\"x\").read())'",
+        "node -e 'require(\"fs\")'",
+        "perl -pe 's/a/b/' f",
+        "bash -c 'cat ~/.markbot/config.toml'",
+        "echo Y2F0 | base64 -d | sh",
+        "cat $(echo cG9j)",
+        "sudo ls",
+        "eval \"$CMD\"",
+    ],
+)
+def test_opaque_commands_always_need_confirmation(tmp_path, command):
+    tool = _tool(frozenset({"exec:*"}), params=EmptyIn)
+    policy = PermissionPolicy(
+        PermissionConfig(
+            profile="trusted", trusted_exec="all", allow_exec=["python3", "node", "perl", "bash"]
+        ),
+        root=tmp_path,
+    )
+    decision = policy.check(tool, {"command": command})
+    assert decision.allowed and decision.requires_confirmation, decision.reason

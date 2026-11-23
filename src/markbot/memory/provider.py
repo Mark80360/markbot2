@@ -13,7 +13,13 @@ from datetime import datetime
 from pathlib import Path
 
 from markbot.memory.lifespan import inject_line
-from markbot.memory.store import INDEX_LIMIT, INDEX_REL, RESIDENT_LIMIT, RESIDENT_REL
+from markbot.memory.store import (
+    INDEX_LIMIT,
+    INDEX_REL,
+    RESIDENT_LIMIT,
+    RESIDENT_REL,
+    render_index,
+)
 
 _logger = logging.getLogger("markbot.memory")
 
@@ -98,16 +104,7 @@ def _render_index(path: Path, limit: int) -> str:
     entries = data.get("entries") if isinstance(data, dict) else None
     if not isinstance(entries, dict) or not entries:
         return ""
-    today = _today()
-    lines: list[str] = []
-    for slug in sorted(entries):
-        entry = entries.get(slug) or {}
-        title = str(entry.get("title") or slug).strip()
-        summary = str(entry.get("summary") or "").strip()
-        review = str(entry.get("review_after") or "")
-        mark = "（待复核）" if review and review <= today else ""
-        lines.append(f"- {slug}{mark}: {summary or title}")
-    text = "\n".join(lines)
+    text = render_index(entries, today=_today())
     if len(text) > limit:
         text = text[:limit] + "\n…（索引已截断）"
     return text

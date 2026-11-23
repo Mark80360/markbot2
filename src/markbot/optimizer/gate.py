@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import re
 import tomllib
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
@@ -12,21 +11,9 @@ import yaml
 
 from markbot.optimizer.evals import Score
 from markbot.schema.hashing import tree_hash
+from markbot.schema.learned import allowed_path
 
 EPSILON = 1e-9
-
-_ALLOWED = [
-    re.compile(r"^manifest\.json$"),
-    re.compile(r"^strategy/(system_prompt|guardrails|memory)\.md$"),
-    # 长期记忆的按需知识页与索引（由 memory 工具写入）
-    re.compile(r"^memory/wiki/[a-z0-9][a-z0-9_\-]*\.md$"),
-    re.compile(r"^memory/wiki/archive/[a-z0-9][a-z0-9._\-]*\.md$"),
-    re.compile(r"^memory/wiki/index\.json$"),
-    re.compile(r"^tool_notes/[a-z0-9][a-z0-9_\-]*\.md$"),
-    re.compile(r"^skills/[a-z0-9][a-z0-9_\-]*/SKILL\.md$"),
-    re.compile(r"^skills/[a-z0-9][a-z0-9_\-]*/(scripts|references|assets)/[A-Za-z0-9_.\-]+$"),
-    re.compile(r"^sub_agents/[a-z0-9][a-z0-9_\-]*\.md$"),
-]
 
 
 @dataclass
@@ -36,10 +23,6 @@ class GateResult:
 
     def as_dict(self) -> dict:
         return {"passed": self.passed, "reasons": list(self.reasons)}
-
-
-def allowed_path(rel: str) -> bool:
-    return any(rx.match(rel) for rx in _ALLOWED)
 
 
 def illegal_paths(directory: Path) -> list[str]:

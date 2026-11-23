@@ -12,10 +12,10 @@ from typing import Any, Protocol
 from markbot.optimizer.adapter import SessionStore
 from markbot.optimizer.evals import EvalCase, EvalSuite, Score
 from markbot.optimizer.gate import evaluate
-from markbot.optimizer.snapshots import promote, read_tree, write_tree
+from markbot.optimizer.snapshots import LearnedConflict, promote, read_tree, write_tree
 from markbot.schema.hashing import tree_hash
 
-PROPOSER_SYSTEM = """你是 MarkBot2 的离线优化器。你会看到当前学习层和已完成的会话摘要。
+PROPOSER_SYSTEM = """你是 MarkBot 的离线优化器。你会看到当前学习层和已完成的会话摘要。
 你的任务是改进系统提示词，让下一次会话更可靠。
 硬约束：
 - 只输出一个 ```markdown 代码块，内容是完整的 system_prompt.md。
@@ -37,6 +37,12 @@ class OptimizerSettings:
     max_sessions_per_task: int = 3
     max_tasks_per_run: int = 5
     idle_minutes: int = 30
+    # 回归集少于这么多条时不晋升：4 条 contains 检查几乎永远「不掉分」，门禁形同虚设
+    min_eval_cases: int = 10
+    # 新增/修改技能（skills/**）的候选默认不自动晋升，放进 optimizer/pending/ 等人工确认
+    approve_skills: bool = False
+    # 可选的 LLM 评分器：judge(answer, rubric) -> bool，用于 llm_judge 检查
+    judge: Any = None
 
 
 @dataclass
@@ -122,13 +128,15 @@ def summarize_sessions(store: SessionStore, metas: list[Any], limit: int = 3) ->
 
 
 def _fallback_prompt(current: str, summary: str) -> str:
-    base = current.strip() or "你是 MarkBot2，一个边界清晰、可审计的个人助手。"
+    # 不把会话摘要写进系统提示：摘要里有用户请求原文，晋升后会永久进入每一轮上下文
+    base = current.strip() or "你是 MarkBot，一个边界清晰、可审计的个人助手。"
+    if "## 经验约束" in base:
+        return base + "\n"
     return (
         f"{base}\n\n## 经验约束\n\n"
         "- 先确认目标与约束，再调用工具；信息不足时说明缺口。\n"
         "- 工具失败时如实报告，并改用可验证的替代路径。\n"
-        "- 交付物落盘，回复中给出路径与关键结论。\n\n"
-        f"最近会话观察：\n{summary}"
+        "- 交付物落盘，回复中给出路径与关键结论。\n"
     )
 
 
@@ -159,8 +167,7 @@ def propose_dom(current_tree: dict[str, str], summary: str, domain: str) -> dict
         "1. 先确认输入文件与期望产出。\n"
         "2. 用工具读取源数据，不臆测内容。\n"
         "3. 产出结构化结果并落盘。\n"
-        "4. 在回复中给出路径与校验结论。\n\n"
-        f"最近观察：\n{summary}\n"
+        "4. 在回复中给出路径与校验结论。\n"
     )
     tree = dict(current_tree)
     tree[f"skills/{name}/SKILL.md"] = body
@@ -194,6 +201,8 @@ async def optimize(
     report.tasks = len(metas)
     summary = summarize_sessions(store, metas, limit=settings.max_sessions_per_task)
     current_tree = read_tree(learned_dir)
+    # 候选基于这个版本生成；晋升时若 learned/ 已被其它写入方修改则放弃，避免覆盖丢失
+    base_hash = tree_hash(learned_dir) if learned_dir.exists() else ""
 
     candidates = {
         "inv": await propose_inv(current_tree, summary, provider),
@@ -215,7 +224,14 @@ async def optimize(
         return report
 
     cases: list[EvalCase] = settings_cases(evals_dir)
-    suite = EvalSuite(cases, run_case)
+    if len(cases) < settings.min_eval_cases:
+        report.reasons.append(
+            f"回归集只有 {len(cases)} 条，少于 min_eval_cases={settings.min_eval_cases}，"
+            "门禁无法有效判定，未晋升（往 evals/cases/ 补充用例）"
+        )
+        _audit(home, report)
+        return report
+    suite = EvalSuite(cases, run_case, judge=settings.judge)
     base_dir = learned_dir if learned_dir.exists() else runs_dir / "base"
     base_score: Score = await suite.score(base_dir)
     report.base_score = str(base_score)
@@ -257,12 +273,29 @@ async def optimize(
         _audit(home, report)
         return report
 
-    parent, new_hash = promote(
-        candidates[kind],
-        learned_dir,
-        home / "snapshots",
-        origin_task=metas[-1].id if metas else None,
-    )
+    touched = _skill_changes(current_tree, candidates[kind])
+    if touched and not settings.approve_skills:
+        pending = home / "optimizer" / "pending" / f"{run_id}-{kind}"
+        write_tree(pending, candidates[kind])
+        report.reasons.append(
+            f"候选修改了技能（{', '.join(touched)}），需要人工确认；已保存到 {pending}。"
+            "确认后运行 `markbot optimize --approve-skills`"
+        )
+        _audit(home, report)
+        return report
+
+    try:
+        parent, new_hash = promote(
+            candidates[kind],
+            learned_dir,
+            home / "snapshots",
+            origin_task=metas[-1].id if metas else None,
+            expected_hash=base_hash,
+        )
+    except LearnedConflict as exc:
+        report.reasons.append(f"{exc}（记忆在评估期间有新写入），下次运行重试")
+        _audit(home, report)
+        return report
     report.promoted = True
     report.parent_snapshot = parent
     report.new_snapshot = new_hash
@@ -276,6 +309,12 @@ def settings_cases(directory: Path) -> list[EvalCase]:
     from markbot.optimizer.evals import load_cases
 
     return load_cases(directory)
+
+
+def _skill_changes(current: dict[str, str], candidate: dict[str, str]) -> list[str]:
+    """候选相对当前学习层新增、修改或删除的技能文件。"""
+    paths = {p for p in (*current, *candidate) if p.startswith("skills/")}
+    return sorted(p for p in paths if current.get(p) != candidate.get(p))
 
 
 def _reject(home: Path, run_id: str, kind: str, candidate_dir: Path) -> None:

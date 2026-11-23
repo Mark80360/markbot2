@@ -8,15 +8,45 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any
+from pathlib import Path
+from typing import Any, Protocol, runtime_checkable
 
 from markbot.kernel.runtime_view import RuntimeView
-from markbot.memory.provider import MemoryProvider
 
 _logger = logging.getLogger("markbot.context")
 
 SKILL_INDEX_MAX = 8_000
+
+# 扩展通过 ``api.append_entry(CONTEXT_PROVIDERS, factory)`` 注册常驻上下文来源；
+# ``factory(learned_dir)`` 返回带 ``render()`` 的对象或 ``None``。Kernel 不直接依赖
+# 记忆实现（markbot.memory），记忆只是扩展车道上的一个提供者。
+CONTEXT_PROVIDERS = "context_providers"
+
+
+@runtime_checkable
+class ContextProvider(Protocol):
+    def render(self) -> str: ...
+
+
+ContextProviderFactory = Callable[[Path], "ContextProvider | None"]
+
+
+def providers_from_runtime(runtime: Any) -> list[ContextProvider]:
+    learned = getattr(runtime, "learned_dir", None)
+    if learned is None:
+        return []
+    out: list[ContextProvider] = []
+    for factory in (getattr(runtime, "entries", None) or {}).get(CONTEXT_PROVIDERS, []):
+        try:
+            provider = factory(Path(learned))
+        except Exception as exc:  # noqa: BLE001 - 单个提供者失败不影响组装
+            _logger.warning("上下文提供者初始化失败: %s", exc)
+            continue
+        if provider is not None:
+            out.append(provider)
+    return out
 
 
 @dataclass
@@ -64,30 +94,51 @@ class ContextBuilder:
         runtime: RuntimeView,
         *,
         budget_chars: int = 60_000,
-        memory: MemoryProvider | None = None,
+        memory: ContextProvider | None = None,
     ) -> None:
         self.runtime = runtime
         self.budget_chars = budget_chars
         # ``strategy.memory`` 只是启动快照；常驻块必须每轮从 learned/ 重新渲染，
-        # 否则本回合写入、下回合读不到。
-        learned = getattr(runtime, "learned_dir", None)
-        self.memory = memory if memory is not None else (
-            MemoryProvider(learned) if learned is not None else None
-        )
+        # 否则本回合写入、下回合读不到。未显式传入时取扩展注册的第一个提供者。
+        if memory is None:
+            found = providers_from_runtime(runtime)
+            memory = found[0] if found else None
+        self.memory = memory
 
     async def build(self, session: Any, tool_schemas: list[dict[str, Any]]) -> dict[str, Any]:
         return {
-            "system": self._compose_system(),
+            "system": self._compose_system(session),
             "messages": session.messages_for_model(),
             "tools": tool_schemas,
         }
 
-    def _compose_system(self) -> str:
+    def _active_skills(self, session: Any) -> str:
+        """渲染本轮 ``$skill`` 显式指定的技能正文，调用结束后不留在会话里。"""
+        blocks: list[str] = []
+        for name in session.metadata.get("_active_skills") or []:
+            try:
+                meta, body = self.runtime.skills.read_body(str(name))
+            except KeyError:
+                continue
+            blocks.append(f"### {meta.name}\n{body}")
+        if not blocks:
+            return ""
+        text = "用户显式指定的技能（按正文执行）：\n\n" + "\n\n".join(blocks)
+        if len(text) > 20_000:
+            text = text[:20_000] + "\n[… 技能正文过长，已截断]"
+        return text
+
+    def _compose_system(self, session: Any) -> str:
         strategy = self.runtime.strategy
         resident = self.memory.render() if self.memory is not None else strategy.memory
         sections = [
             Section("system_prompt", strategy.system_prompt, priority=100, hard=True),
             Section("guardrails", strategy.guardrails, priority=95, hard=True),
+            Section(
+                "active_skills",
+                self._active_skills(session),
+                priority=85,
+            ),
             Section("memory", resident, priority=70),
             Section("tool_notes", strategy.tool_notes, priority=65),
             Section("prompts", "\n\n".join(strategy.prompts), priority=60),
@@ -109,4 +160,10 @@ class ContextBuilder:
         return text
 
 
-__all__ = ["ContextBuilder"]
+__all__ = [
+    "CONTEXT_PROVIDERS",
+    "ContextBuilder",
+    "ContextProvider",
+    "ContextProviderFactory",
+    "providers_from_runtime",
+]

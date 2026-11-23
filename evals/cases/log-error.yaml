@@ -1,0 +1,8 @@
+id: log-error
+domain: code
+prompt: 在 fixtures/app.log 里找出 ERROR 级别的日志，说明出了什么问题。
+files:
+  - fixtures/app.log
+checks:
+  - type: contains
+    value: disk full

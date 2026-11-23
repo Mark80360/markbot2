@@ -153,7 +153,8 @@ def test_optimize_promotes_and_is_rollbackable(tmp_path):
             evals_dir=project / "evals" / "cases",
             provider=EchoProvider(),
             run_case=run_case,
-            settings=OptimizerSettings(max_tasks_per_run=5),
+            # 单元测试只放 1 条用例；真实运行默认要求 >= 10 条
+            settings=OptimizerSettings(max_tasks_per_run=5, min_eval_cases=1),
             emit=lambda *_: None,
         )
     )
@@ -216,3 +217,64 @@ def test_optimize_dry_run_does_not_promote(tmp_path):
     assert not report.promoted
     assert any("dry-run" in reason for reason in report.reasons)
     assert read_tree(learned)["strategy/system_prompt.md"] == "base\n"
+
+
+def test_optimize_refuses_with_too_few_cases(tmp_path):
+    home = tmp_path / "home"
+    project = tmp_path / "project"
+    project.mkdir()
+    learned = _prepare_home(home, project)
+
+    async def run_case(harness_dir: Path, case: EvalCase) -> str:
+        return "hello-markbot"
+
+    report = asyncio.run(
+        optimize(
+            home=home,
+            learned_dir=learned,
+            evals_dir=project / "evals" / "cases",
+            provider=EchoProvider(),
+            run_case=run_case,
+            settings=OptimizerSettings(min_eval_cases=10),
+            emit=lambda *_: None,
+        )
+    )
+    assert not report.promoted
+    assert any("min_eval_cases" in reason for reason in report.reasons)
+    assert read_tree(learned) == {"strategy/system_prompt.md": "base\n"}
+
+
+def test_skill_candidates_wait_for_approval(tmp_path):
+    from markbot.optimizer.run import _skill_changes
+
+    assert _skill_changes({}, {"skills/x/SKILL.md": "a"}) == ["skills/x/SKILL.md"]
+    assert _skill_changes({"skills/x/SKILL.md": "a"}, {"skills/x/SKILL.md": "a"}) == []
+    assert _skill_changes({"skills/x/SKILL.md": "a"}, {}) == ["skills/x/SKILL.md"]
+
+
+def test_proposals_do_not_embed_session_text(tmp_path):
+    from markbot.optimizer.run import _fallback_prompt, propose_dom
+
+    secret_request = "帮我把合同发给张三 13800000000"
+    tree = propose_dom({}, f"request: {secret_request}", "office")
+    assert all(secret_request not in text for text in tree.values())
+    assert secret_request not in _fallback_prompt("base", f"request: {secret_request}")
+
+
+def test_llm_judge_is_scored_when_judge_given():
+    from markbot.optimizer.evals import Check, score_case
+
+    case = EvalCase(
+        id="j",
+        prompt="p",
+        checks=(Check(type="contains", value="ok"), Check(type="llm_judge", rubric="礼貌")),
+    )
+    assert asyncio.run(score_case("ok", case)).total == 1  # 无 judge 时跳过
+    passed = asyncio.run(score_case("ok", case, judge=lambda text, rubric: "ok" in text))
+    assert (passed.passed, passed.total) == (2, 2)
+
+    async def failing(text, rubric):
+        raise RuntimeError("judge down")
+
+    failed = asyncio.run(score_case("ok", case, judge=failing))
+    assert (failed.passed, failed.total) == (1, 2)

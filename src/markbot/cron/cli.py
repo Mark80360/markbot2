@@ -14,7 +14,7 @@ from pathlib import Path
 from markbot.api.ui import NullUI
 from markbot.cron.runner import build_job_runner
 from markbot.cron.service import CronError, CronService, resolve_timezone
-from markbot.cron.tool import _parse_at, _format_job
+from markbot.cron.tool import _format_job, _parse_at
 from markbot.cron.types import CronSchedule, ms_to_iso
 
 USAGE = """用法：
@@ -157,9 +157,6 @@ def _history(service: CronService, rest: list[str]) -> int:
         )
         if run.error:
             print(f"  错误: {run.error}")
-        preview = run.response.strip().replace("\n", " ")
-        if preview:
-            print(f"  结果: {preview[:300]}")
     return 0
 
 

@@ -1,0 +1,14 @@
+[package]
+name = "skill-creator"
+version = "0.1.0"
+description = "技能创建技能：初始化、校验与打包 SKILL.md"
+license = "MIT"
+priority = 80
+
+[permissions]
+capabilities = []
+
+[resources]
+extensions = []
+skills = ["."]
+prompts = []

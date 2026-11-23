@@ -1,0 +1,14 @@
+[package]
+name = "clawhub"
+version = "0.1.0"
+description = "ClawHub 公共技能市场：检索与安装技能（npx clawhub）"
+license = "MIT"
+priority = 80
+
+[permissions]
+capabilities = []
+
+[resources]
+extensions = []
+skills = ["."]
+prompts = []

@@ -19,7 +19,14 @@ def _openpyxl():
     return openpyxl
 
 
-def _resolve(ctx, raw: str) -> Path:
+def _resolve(ctx, raw: str, *, write: bool = False) -> Path:
+    """优先走执行环境：受保护目录（MarkBot home、学习层）与例外目录的判定只有一份。"""
+    env = getattr(ctx, "env", None)
+    if env is not None and callable(getattr(env, "resolve", None)):
+        try:
+            return env.resolve(raw, write=write)
+        except TypeError:  # 旧执行环境的 resolve 不接受 write 参数
+            return env.resolve(raw)
     path = Path(raw).expanduser()
     root = Path(ctx.policy.root).resolve()
     resolved = (root / path).resolve() if not path.is_absolute() else path.resolve()
@@ -31,13 +38,13 @@ def _resolve(ctx, raw: str) -> Path:
 
 
 class ReadIn(BaseModel):
-    path: str = Field(description="xlsx 文件路径")
+    path: str = Field(description="xlsx 文件路径", json_schema_extra={"x-markbot-role": "path"})
     sheet: str = Field(default="", description="工作表名，留空取第一个")
     max_rows: int = Field(default=200, ge=1, le=5000)
 
 
 class WriteIn(BaseModel):
-    path: str = Field(description="输出 xlsx 路径")
+    path: str = Field(description="输出 xlsx 路径", json_schema_extra={"x-markbot-role": "path"})
     sheet: str = Field(default="Sheet1")
     rows: list[list[str | int | float | None]] = Field(
         default_factory=list, description="二维表数据，第一行通常为表头"
@@ -45,7 +52,7 @@ class WriteIn(BaseModel):
 
 
 class ListIn(BaseModel):
-    path: str = Field(description="xlsx 文件路径")
+    path: str = Field(description="xlsx 文件路径", json_schema_extra={"x-markbot-role": "path"})
 
 
 def setup(api: ExtensionAPI) -> None:
@@ -79,7 +86,7 @@ def setup(api: ExtensionAPI) -> None:
     async def xlsx_write(ctx, args: WriteIn) -> ToolResult:
         try:
             openpyxl = _openpyxl()
-            path = _resolve(ctx, args.path)
+            path = _resolve(ctx, args.path, write=True)
             path.parent.mkdir(parents=True, exist_ok=True)
             wb = openpyxl.Workbook()
             ws = wb.active

@@ -2,7 +2,9 @@
 
 参考 Pi 的 compaction 策略：
 - 保留最近一段原文，只压缩更早的前缀；
-- 切点落在 user / assistant 边界，避免拆散 tool call 与 tool result；
+- 优先切在 user 边界；当前回合本身就超出预算时（长工具循环只有一条 user 消息），
+  退到回合内的 assistant 边界——切在 assistant 前面不会拆散 tool call 与 tool result；
+- 被移除的部分只剩上一次的摘要锚点时不压缩：那只是重新摘要一遍摘要，白花一次模型调用；
 - 优先用模型生成结构化摘要，失败时退化为确定性摘要。
 """
 
@@ -21,7 +23,10 @@ from markbot.schema.models import Message
 TOOL_RESULT_MAX_CHARS = 2000
 TRIGGER_RATIO = 0.8
 KEEP_RATIO = 0.4
+# 保留区的上限：超过它说明保留下来的仍会很快再次触发压缩，需要切进当前回合
+MAX_KEEP_RATIO = 0.6
 MIN_KEEP_CHARS = 4000
+CURRENT_REQUEST_MAX_CHARS = 2000
 
 
 def spill_tool_result(
@@ -102,21 +107,58 @@ def estimate_chars(payload: dict[str, Any]) -> int:
     return total
 
 
-def select_cut(messages: list[Message], keep_chars: int) -> int | None:
-    """从尾部向前累计，找到保留区起点；只在 user 消息处切。"""
-    candidates = [
-        index for index, message in enumerate(messages) if message.role == "user"
-    ]
-    if not candidates:
+def is_compaction_marker(message: Message) -> bool:
+    return message.role == "user" and (message.content or "").startswith(COMPACTION_PREFIX)
+
+
+def _last_request_index(messages: list[Message]) -> int | None:
+    for index in range(len(messages) - 1, -1, -1):
+        if messages[index].role == "user" and not is_compaction_marker(messages[index]):
+            return index
+    return None
+
+
+def select_cut(
+    messages: list[Message], keep_chars: int, max_keep_chars: int | None = None
+) -> int | None:
+    """从尾部向前累计，找到保留区起点（``messages[cut:]`` 原样保留）。
+
+    1. 优先切在 user 边界：取保留量达到 ``keep_chars`` 处之后的第一条 user 消息；
+    2. 没有这样的 user 边界时保留整个最近回合；但若最近回合本身超过
+       ``max_keep_chars``，就切进回合内部，落在 assistant 消息前面（其 tool 结果紧随其后，
+       调用与结果不会被拆开）；
+    3. 被移除的前缀只有压缩锚点时返回 ``None``：没有可节省的内容。
+    """
+    users = [index for index, message in enumerate(messages) if message.role == "user"]
+    if not users:
         return None
+    start: int | None = None
     kept = 0
     for index in range(len(messages) - 1, -1, -1):
         kept += message_chars(messages[index])
-        if kept < keep_chars:
-            continue
-        cut = next((item for item in candidates if item >= index), candidates[-1])
-        return cut if cut > 0 else None
-    return None
+        if kept >= keep_chars:
+            start = index
+            break
+    if start is None:
+        return None
+
+    cut = next((item for item in users if item >= start), None)
+    if cut is None:
+        cut = users[-1]
+        turn_chars = sum(message_chars(message) for message in messages[cut:])
+        if max_keep_chars is not None and turn_chars > max_keep_chars:
+            inner = [
+                index
+                for index, message in enumerate(messages)
+                if index > cut and message.role == "assistant"
+            ]
+            if inner:
+                cut = next((item for item in inner if item >= start), inner[-1])
+    if cut <= 0:
+        return None
+    if all(is_compaction_marker(message) for message in messages[:cut]):
+        return None
+    return cut
 
 
 def _truncate(text: str, limit: int) -> str:
@@ -197,16 +239,22 @@ class Compactor:
         self.budget_chars = max(2000, int(budget_chars))
         self.trigger_chars = int(self.budget_chars * TRIGGER_RATIO)
         self.keep_chars = max(MIN_KEEP_CHARS, int(self.budget_chars * KEEP_RATIO))
+        self.max_keep_chars = max(self.keep_chars, int(self.budget_chars * MAX_KEEP_RATIO))
 
     def should_compact(self, payload: dict[str, Any]) -> bool:
         return estimate_chars(payload) > self.trigger_chars
 
     async def compact(self, session: Session) -> CompactionOutcome | None:
         before = len(session.messages)
-        cut = select_cut(session.messages, self.keep_chars)
+        cut = select_cut(session.messages, self.keep_chars, self.max_keep_chars)
         if cut is None:
             return None
         summary = await summarize(self.provider, session.messages[:cut])
+        request_index = _last_request_index(session.messages)
+        if request_index is not None and request_index < cut:
+            # 切进了当前回合：用户这一轮的原始请求会被摘要掉，原文附在摘要后，避免目标走样
+            request = _truncate(session.messages[request_index].content, CURRENT_REQUEST_MAX_CHARS)
+            summary = f"{summary.rstrip()}\n\n## 当前请求原文\n{request}"
         session.apply_compaction(summary, cut)
         return CompactionOutcome(
             before=before,
@@ -223,6 +271,7 @@ __all__ = [
     "Compactor",
     "estimate_chars",
     "fallback_summary",
+    "is_compaction_marker",
     "select_cut",
     "serialize_messages",
     "summarize",

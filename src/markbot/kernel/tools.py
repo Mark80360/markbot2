@@ -6,9 +6,11 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
+from markbot.api.execution import ExecutionEnvironment
 from markbot.api.extension import Command
 from markbot.api.tool import Tool
 from markbot.api.ui import UI, NullUI
+from markbot.kernel.execution import LocalExecution
 from markbot.kernel.permissions import PermissionPolicy
 
 
@@ -97,9 +99,15 @@ class KernelToolContext:
         policy: PermissionPolicy,
         secrets: Mapping[str, str] | None = None,
         ui: UI | None = None,
+        env: ExecutionEnvironment | None = None,
     ) -> None:
         self.session = session
         self.policy = policy
+        self.env = env or LocalExecution(
+            policy.root,
+            guard=getattr(policy, "guard", None),
+            os_sandbox_mode=getattr(policy, "os_sandbox", "off"),
+        )
         self._secrets = secrets or {}
         self._ui = ui or NullUI()
 
