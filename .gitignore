@@ -13,7 +13,7 @@ env/
 .coverage
 .coverage.*
 htmlcov/
-${APPDATA}/
+.docs/
 # 历史手工补丁备份：纳入 git 后不再需要
 .patch_backup/
 
@@ -57,3 +57,9 @@ Thumbs.db
 desktop.ini
 .idea/
 .vscode/
+
+# CI 与夜间评测的临时目录（ADR 0016）
+.ci-markbot-home/
+.eval-home/
+.eval-trend/
+eval-*.json

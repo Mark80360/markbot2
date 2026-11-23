@@ -1,0 +1,4 @@
+prompt: |
+  把 inventory 包里的函数 get_total 重命名为 total_value（定义与所有调用处都要改，不保留旧名字），
+  然后运行测试确认全部通过。不要修改测试。
+allowed: ["inventory/*.py"]

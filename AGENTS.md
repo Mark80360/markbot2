@@ -71,6 +71,10 @@ optimizer -> schema          channels -> HTTP（+ kernel.gateway_log / local_aut
 ```
 
 新增顶层模块时补一条契约测试（参考 `tests/test_contracts.py`）。
+CI（`.github/workflows/ci.yml`）在 Linux 与 Windows 上跑同样的门禁和 `tests/test_shell_smoke.py`：
+新增 shell 相关代码时两种 shell（bash / pwsh）都要考虑，测试里的命令按 `shell_name()` 选写法。
+改动提示词、工具描述或回合逻辑后，有条件时跑 `markbot eval --suite coding --record --fail-on-regression`
+（夜间评测 `.github/workflows/eval.yml` 会自动跑并与上一次比较）。
 不阻断但只许变好：`bash scripts/lint_strict.sh`（ruff B/UP/SIM/RUF + pyright）。
 改动 `learned/` 晋升逻辑或提示词模板时，跑一次 `markbot optimize --dry-run` 看回归分。
 变更会话/循环语义时同步更新 `docs/ARCHITECTURE.md` 与 `docs/decisions/`。

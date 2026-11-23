@@ -43,6 +43,10 @@ class OptimizerSettings:
     approve_skills: bool = False
     # 可选的 LLM 评分器：judge(answer, rubric) -> bool，用于 llm_judge 检查
     judge: Any = None
+    # 额外的晋升门禁评测集（ADR 0016）：名字 -> async runner(harness_dir) -> Score。
+    # 每个评测集都只许变好；由 CLI 按 [optimizer] gate_suites 组装（编码、浏览器评测）
+    extra_suites: dict[str, Any] = field(default_factory=dict)
+    gate_tolerance: float = 0.0
 
 
 @dataclass
@@ -60,6 +64,8 @@ class OptimizationReport:
     # learned/ 由门禁自动信任，但同样要留下审计记录（7.2 规则 4）。
     learned_auto_trust: bool = False
     proposals: list[str] = field(default_factory=list)
+    # 门禁里各评测集的「当前 -> 候选」分数（ADR 0016）
+    suite_scores: dict[str, str] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -260,7 +266,14 @@ async def optimize(
         _audit(home, report)
         return report
 
-    gate = await evaluate(candidate_dir, base_dir, suite.score)
+    gate = await evaluate(
+        candidate_dir,
+        base_dir,
+        suite.score,
+        extra_suites=settings.extra_suites,
+        tolerance=settings.gate_tolerance,
+    )
+    report.suite_scores = dict(gate.scores)
     if not gate.passed:
         report.reasons.extend(gate.reasons)
         for name, directory in candidate_dirs.items():

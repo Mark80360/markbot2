@@ -14,12 +14,13 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 
 _logger = logging.getLogger("markbot.retention")
-_DAY = re.compile(r"^(\d{4}-\d{2}-\d{2})\.(md|log)$")
+_DAY = re.compile(r"^(\d{4}-\d{2}-\d{2})\.(md|log|jsonl)$")
 
 # 目录 -> 配置里对应的保留天数字段；交互日志体积最大，单独设置
 CATEGORIES = {
     "logs/interaction": "interaction_retention_days",
     "logs/runtime": "retention_days",
+    "logs/events": "retention_days",
     "gateway": "retention_days",
 }
 

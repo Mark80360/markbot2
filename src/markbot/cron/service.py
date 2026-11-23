@@ -88,6 +88,14 @@ class CronService:
         default_timezone: str | None = None,
         max_history: int = 3,
         max_delay_s: float = 60.0,
+        max_concurrent: int = 2,
+        job_timeout_s: float = 1800.0,
+        max_retries: int = 1,
+        retry_backoff_s: float = 300.0,
+        misfire_policy: str = "run_once",
+        misfire_grace_s: float = 6 * 3600.0,
+        alert_after_failures: int = 2,
+        on_failure: Callable[[CronJob, int, str], None] | None = None,
     ) -> None:
         self.store_path = Path(store_path)
         self.on_job = on_job
@@ -97,6 +105,17 @@ class CronService:
         self.default_timezone = default_timezone or None
         self.max_history = max(1, int(max_history))
         self.max_delay_s = max(0.05, float(max_delay_s))
+        # 可靠性（ADR 0010）：并发执行、单次超时、失败重试、错过触发的补跑策略、连续失败告警
+        self.max_concurrent = max(1, int(max_concurrent))
+        self.job_timeout_s = max(0.0, float(job_timeout_s or 0))
+        self.max_retries = max(0, int(max_retries))
+        self.retry_backoff_s = max(1.0, float(retry_backoff_s))
+        self.misfire_policy = misfire_policy if misfire_policy in ("skip", "run_once") else "run_once"
+        self.misfire_grace_s = max(0.0, float(misfire_grace_s))
+        self.alert_after_failures = max(0, int(alert_after_failures))
+        self.on_failure = on_failure
+        self._inflight: dict[str, asyncio.Task[CronRun]] = {}
+        self._retries: dict[str, int] = {}
 
         self._lock = threading.RLock()
         self._running = False
@@ -322,6 +341,13 @@ class CronService:
         self._thread.start()
         return self._thread
 
+    def is_running(self) -> bool:
+        thread = self._thread
+        return thread is not None and thread.is_alive() and not self._stop_requested
+
+    def running_jobs(self) -> list[str]:
+        return sorted(self._inflight)
+
     def _thread_main(self) -> None:
         try:
             asyncio.run(self._run_forever())
@@ -393,6 +419,9 @@ class CronService:
             jobs = self._load()
             changed = False
             for job in jobs:
+                if job.enabled and job.state.next_run_at_ms is not None:
+                    changed |= self._apply_misfire(job, now)
+                    continue
                 if not job.enabled or job.state.next_run_at_ms is not None:
                     continue
                 try:
@@ -406,6 +435,29 @@ class CronService:
             if changed:
                 self._save(jobs)
 
+    def _apply_misfire(self, job: CronJob, now: int) -> bool:
+        """启动时处理停机期间错过的触发：在宽限期内补跑一次，否则跳到下一个周期。"""
+        due = job.state.next_run_at_ms
+        if due is None or due >= now:
+            return False
+        overdue_s = (now - due) / 1000
+        if self.misfire_policy == "run_once" and overdue_s <= self.misfire_grace_s:
+            logger.info("定时任务错过触发，将补跑一次 id=%s 逾期=%ds", job.id, int(overdue_s))
+            return False
+        try:
+            job.state.next_run_at_ms = (
+                None if job.schedule.kind == "at" else self._initial_next(job.schedule, now)
+            )
+        except CronError as exc:
+            job.state.next_run_at_ms = None
+            job.state.last_error = str(exc)
+        if job.state.next_run_at_ms is None:
+            job.enabled = False
+        job.state.last_status = "skipped"
+        job.state.last_error = f"停机期间错过触发（逾期 {int(overdue_s)}s），已按 {self.misfire_policy} 策略跳过"
+        logger.warning("定时任务错过触发已跳过 id=%s 逾期=%ds", job.id, int(overdue_s))
+        return True
+
     def _next_delay_s(self) -> float:
         now = now_ms()
         with self._lock:
@@ -413,7 +465,9 @@ class CronService:
         upcoming = [
             job.state.next_run_at_ms
             for job in jobs
-            if job.enabled and job.state.next_run_at_ms is not None
+            if job.enabled
+            and job.state.next_run_at_ms is not None
+            and job.id not in self._inflight
         ]
         if not upcoming:
             return self.max_delay_s
@@ -421,27 +475,34 @@ class CronService:
         return max(0.05, min(self.max_delay_s, remaining / 1000))
 
     async def _tick(self) -> None:
+        """把到点的任务各自放进后台任务并发执行（不再串行 await，长任务不阻塞其它任务）。
+
+        执行期间不清空 ``next_run_at_ms``：进程在执行中崩溃时，重启后按补跑策略处理
+        （宽限期内补跑一次），而不是像旧实现那样静默丢失这次执行。
+        """
         now = now_ms()
         with self._lock:
-            due_ids = [
-                job.id
+            due = [
+                job
                 for job in self._load()
                 if job.enabled
                 and job.state.next_run_at_ms is not None
                 and job.state.next_run_at_ms <= now
+                and job.id not in self._inflight
             ]
-        for job_id in due_ids:
-            with self._lock:
-                jobs = self._load()
-                job = next((item for item in jobs if item.id == job_id), None)
-                if job is None or not job.enabled or job.state.next_run_at_ms is None:
-                    continue
-                if job.state.next_run_at_ms > now_ms():
-                    continue
-                # 先清空，避免执行期间重启后重复触发
-                job.state.next_run_at_ms = None
-                self._save(jobs)
-            await self._execute(job)
+        for job in sorted(due, key=lambda item: item.state.next_run_at_ms or 0):
+            if len(self._inflight) >= self.max_concurrent:
+                logger.info("定时任务并发已满，稍后执行 id=%s", job.id)
+                break
+            task = asyncio.create_task(self._execute(job), name=f"cron-{job.id}")
+            self._inflight[job.id] = task
+            task.add_done_callback(lambda _t, job_id=job.id: self._job_done(job_id))
+
+    def _job_done(self, job_id: str) -> None:
+        self._inflight.pop(job_id, None)
+        wake = self._wake
+        if wake is not None:
+            wake.set()
 
     async def _execute(self, job: CronJob) -> CronRun:
         if self.on_job is None:
@@ -451,7 +512,14 @@ class CronService:
         error = ""
         response = ""
         try:
-            response = await self.on_job(job)
+            if self.job_timeout_s > 0:
+                response = await asyncio.wait_for(self.on_job(job), timeout=self.job_timeout_s)
+            else:
+                response = await self.on_job(job)
+        except asyncio.TimeoutError:
+            status = "error"
+            error = f"执行超时（超过 {int(self.job_timeout_s)}s），已取消"
+            logger.warning("定时任务超时 id=%s name=%s", job.id, job.name)
         except Exception as exc:  # noqa: BLE001 - 失败写进历史，调度继续
             status = "error"
             error = f"{type(exc).__name__}: {exc}"
@@ -474,10 +542,23 @@ class CronService:
             fresh.state.last_status = status
             fresh.state.last_error = error
             fresh.state.history.insert(0, record)
-            del fresh.state.history[self.max_history :]
-            if fresh.delete_after_run:
+            del fresh.state.history[max(self.max_history, self.alert_after_failures) :]
+            retry = status == "error" and self._retries.get(job.id, 0) < self.max_retries
+            if status == "ok":
+                self._retries.pop(job.id, None)
+            if retry:
+                # 失败重试：退避后再跑一次，不等下一个周期
+                self._retries[job.id] = self._retries.get(job.id, 0) + 1
+                fresh.state.next_run_at_ms = finished + int(self.retry_backoff_s * 1000)
+                fresh.updated_at_ms = finished
+                logger.info(
+                    "定时任务将重试 id=%s 第 %d/%d 次 %ds 后",
+                    job.id, self._retries[job.id], self.max_retries, int(self.retry_backoff_s),
+                )
+            elif fresh.delete_after_run:
                 jobs.remove(fresh)
             else:
+                self._retries.pop(job.id, None)
                 try:
                     next_run = self._next_after_run(fresh.schedule, finished)
                 except CronError as exc:
@@ -488,8 +569,19 @@ class CronService:
                 if next_run is None:
                     fresh.enabled = False
                 fresh.updated_at_ms = finished
+            failures = 0
+            for item in fresh.state.history:
+                if item.status != "error":
+                    break
+                failures += 1
             self._save(jobs)
         self._write_run(job, record)
+        n = self.alert_after_failures
+        if status == "error" and n > 0 and failures >= n and failures % n == 0 and self.on_failure:
+            try:
+                await asyncio.to_thread(self.on_failure, job, failures, error)
+            except Exception:  # noqa: BLE001 - 告警失败不影响调度
+                logger.exception("定时任务失败告警发送失败 id=%s", job.id)
         logger.info(
             "定时任务完成 id=%s name=%s status=%s 耗时=%dms",
             job.id,

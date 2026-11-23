@@ -1,0 +1,5 @@
+prompt: |
+  {base_url}/logs1.html 是分页的日志列表（共 3 页，通过「下一页」翻页）。
+  统计所有页面中级别为 ERROR 的日志条数，回答格式：ERROR 共 N 条。
+expect: ["共7条"]
+max_steps: 20

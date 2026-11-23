@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable
 from datetime import datetime
 from typing import Any, Literal, Optional
@@ -126,12 +127,61 @@ def _add(service: CronService, ctx: ToolContext, args: CronIn) -> ToolResult:
         delivery=delivery,
         notify=notify if delivery == "channel" else {},
     )
-    return ToolResult(
+    warnings = preflight(ctx, args.message)
+    text = (
         f"已创建定时任务 {job.id}（{job.name}）\n"
         f"调度: {schedule.describe()}\n"
         f"下次执行: {ms_to_iso(job.state.next_run_at_ms)}\n"
         f"投递: {_delivery_label(job)}"
     )
+    if warnings:
+        text += "\n\n⚠️ 无人值守执行时可能被拒绝的操作（请转告用户提前放行）：\n" + "\n".join(
+            f"- {item}" for item in warnings
+        )
+    return ToolResult(text, details={"job_id": job.id, "preflight": warnings})
+
+
+_SECRET_LIKE = re.compile(r"\$?\b([A-Z][A-Z0-9_]*(?:TOKEN|KEY|SECRET|PASSWORD))\b")
+
+
+def preflight(ctx: ToolContext, message: str) -> list[str]:
+    """定时任务没有确认对象：创建时就指出哪些操作在无人值守时会被拒绝（ADR 0011）。
+
+    只做静态推断：权限档位、命令免确认名单、任务内容里提到的密钥是否允许注入。
+    实际运行中被拒绝的操作由 runner 在运行后汇总并通知。
+    """
+    policy = getattr(ctx, "policy", None)
+    if policy is None:
+        return []
+    out: list[str] = []
+    profile = str(getattr(policy, "profile", "standard"))
+    if profile == "strict":
+        out.append("当前是 strict 档位：定时任务不能写文件、执行命令、联网或使用密钥")
+        return out
+    allow = sorted(getattr(policy, "allow_exec", set()) or set())
+    needs_listing = profile == "standard" and getattr(policy, "confirm_on_exec", True)
+    needs_listing = needs_listing or (
+        profile == "trusted" and getattr(policy, "trusted_exec", "listed") != "all"
+    )
+    if needs_listing:
+        shown = "、".join(allow[:12]) + ("…" if len(allow) > 12 else "") if allow else "（无）"
+        out.append(
+            "执行命令只有 [permissions].allow_exec 里的程序免确认（当前：" + shown + "）；"
+            "其它命令、python -c 这类内联代码在定时任务里会被拒绝"
+        )
+    if profile == "standard" and getattr(policy, "confirm_on_write", True):
+        out.append("standard 档位下写文件需要确认：定时任务里写文件会被拒绝")
+    names_fn = getattr(ctx, "secret_names", None)
+    configured = set(names_fn()) if callable(names_fn) else set()
+    injectable = set(getattr(policy, "secret_env", {}) or {})
+    mentioned = {match.group(1) for match in _SECRET_LIKE.finditer(message or "")}
+    mentioned |= {name for name in configured if name.lower() in (message or "").lower()}
+    for name in sorted(mentioned - injectable):
+        if name in configured:
+            out.append(f"任务用到密钥 {name}，但它没有在 [permissions.secret_env] 登记，注入会被拒绝")
+        else:
+            out.append(f"任务提到 {name}，但 [secrets] 里没有配置这个密钥")
+    return out
 
 
 def _list(service: CronService, include_disabled: bool) -> ToolResult:

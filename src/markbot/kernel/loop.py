@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import inspect
 import json
 import logging
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -22,6 +24,12 @@ from markbot.kernel.context import ContextBuilder
 from markbot.kernel.daily_log import DailyLog
 from markbot.kernel.events import EventBus
 from markbot.kernel.execution import LocalExecution
+from markbot.kernel.metrics import (
+    add_usage,
+    classify_provider_error,
+    classify_tool_error,
+    normalize_usage,
+)
 from markbot.kernel.permissions import PermissionPolicy
 from markbot.kernel.providers.base import (
     ContentRejectedError,
@@ -34,7 +42,20 @@ from markbot.kernel.session import redact_known
 from markbot.kernel.tools import KernelToolContext, ToolRegistry
 from markbot.kernel.turn import turn_ui
 
+
+def add_turn_usage(usage: dict[str, int] | None) -> None:
+    """把子代理等额外调用的 usage（归一化字段）计入当前回合（ADR 0013）。"""
+    total = _TURN_USAGE.get()
+    if total is None or not usage:
+        return
+    for key in ("tokens_in", "tokens_out", "tokens_cached"):
+        total[key] = total.get(key, 0) + int(usage.get(key) or 0)
+
 _logger = logging.getLogger("markbot.loop")
+# 本回合累计 usage：AgentLoop 被并发回合共享，不能放实例属性
+_TURN_USAGE: contextvars.ContextVar[dict[str, int] | None] = contextvars.ContextVar(
+    "markbot_turn_usage", default=None
+)
 
 # 被上游内容安全策略拒绝的上下文用这条占位替换，保留消息结构（工具调用配对不破坏）。
 _MODERATION_PLACEHOLDER = "[该条内容触发上游内容安全策略，已从上下文中移除]"
@@ -60,6 +81,68 @@ def _mask_known_secrets(result: ToolResult) -> ToolResult:
     return ToolResult(content=masked + _MASK_NOTICE, is_error=result.is_error, details=details)
 
 
+async def run_sync_handler(handler: Any, ctx: Any, args: Any, *, name: str = "tool") -> Any:
+    """在守护线程里执行同步工具 handler，结果回到当前事件循环。
+
+    不用 ``asyncio.to_thread``：默认线程池在 ``asyncio.run`` 结束时会等待所有线程退出，
+    超时的工具会把整个回合拖到它自己结束为止。守护线程超时后被放弃（Python 线程无法强杀，
+    handler 应自行尽快返回），不阻塞回合结束。contextvars（回合 UI、授权）会复制进线程。
+    """
+    loop = asyncio.get_running_loop()
+    future: asyncio.Future[Any] = loop.create_future()
+    context = contextvars.copy_context()
+
+    def deliver(setter: Any, value: Any) -> None:
+        if not future.done():
+            setter(value)
+
+    def target() -> None:
+        try:
+            value = context.run(handler, ctx, args)
+        except BaseException as exc:  # noqa: BLE001 - 原样交回事件循环
+            setter, value = future.set_exception, exc
+        else:
+            setter = future.set_result
+        try:
+            loop.call_soon_threadsafe(deliver, setter, value)
+        except RuntimeError:
+            pass  # 事件循环已关闭（超时后回合已结束）：结果丢弃
+
+    threading.Thread(target=target, daemon=True, name=f"tool-{name}").start()
+    outcome = await future
+    if inspect.isawaitable(outcome):
+        outcome = await outcome
+    return outcome
+
+
+CONFIRM_PREVIEW_CHARS = 800
+_COMMAND_ARGS = ("command", "cmd", "script", "code")
+
+
+def confirm_preview(args: Any, limit: int = CONFIRM_PREVIEW_CHARS) -> str:
+    """确认弹窗里展示的参数。
+
+    命令类参数（command/cmd/script/code）完整展示：用户批准的必须是将要执行的全部内容，
+    只看开头可能漏掉结尾拼接的危险操作。其余参数超长时保留首尾并标注总长度。
+    """
+    if isinstance(args, dict):
+        commands = [
+            f"{key}:\n{value}"
+            for key, value in args.items()
+            if key in _COMMAND_ARGS and isinstance(value, str)
+        ]
+        rest = {key: value for key, value in args.items() if key not in _COMMAND_ARGS}
+    else:
+        commands, rest = [], args
+    text = json.dumps(rest, ensure_ascii=False) if rest else ""
+    if len(text) > limit:
+        head = limit * 2 // 3
+        tail = limit - head
+        text = f"{text[:head]}\n…（中间省略，共 {len(text)} 字符）…\n{text[-tail:]}"
+    parts = [*commands, text] if text else commands
+    return "\n\n".join(parts) if parts else "{}"
+
+
 @dataclass
 class LoopConfig:
     max_steps: int = 30
@@ -73,6 +156,28 @@ class LoopConfig:
     repeat_tool_limit: int = 3
     max_tool_calls: int = 100
     permission_denial_limit: int = 3
+    # 改了代码却没验证就要结束时，提醒模型验证一次（ADR 0012）
+    verify_reminder: bool = True
+
+
+VERIFY_REMINDER = (
+    "[系统提醒] 你在本轮修改了代码（{files}），但还没有运行测试或检查。"
+    "请先用 run_tests / run_checks 验证改动并修复发现的问题；"
+    "如果确实无法或不需要验证，直接说明原因后结束。"
+)
+
+
+def _needs_verification(session: Any) -> bool:
+    changed = getattr(session, "code_changed_at", None)
+    if not changed:
+        return False
+    return (getattr(session, "verified_at", None) or 0) < changed
+
+
+def _changed_files(session: Any, limit: int = 5) -> str:
+    names = [Path(path).name for path in (getattr(session, "file_changes", None) or {})]
+    shown = "、".join(names[:limit])
+    return shown + (f" 等 {len(names)} 个文件" if len(names) > limit else "")
 
 
 @dataclass
@@ -82,7 +187,9 @@ class TurnResult:
     stopped_reason: str = "completed"
     error: str | None = None
     session_id: str | None = None
+    # 最后一步的原始 usage（兼容旧字段）；total_usage 是本回合所有模型调用的累计（归一化字段）
     usage: dict[str, int] = field(default_factory=dict)
+    total_usage: dict[str, int] = field(default_factory=dict)
 
 
 class AgentLoop:
@@ -101,8 +208,22 @@ class AgentLoop:
         logs: DailyLog | None = None,
         files_root: Path | None = None,
         env: ExecutionEnvironment | None = None,
+        compact_provider: Provider | None = None,
+        scope: Any = None,
+        subagent: Any = None,
+        token_budget: int = 0,
+        vision: Any = None,
     ) -> None:
         self._provider = provider
+        # 视觉描述器：Kernel 注入，经 ToolContext.describe_image 暴露给 view_image（ADR 0015）
+        self._vision = vision
+        # 回合级的 (policy, env)：绑定项目时工作区不同（ADR 0013）；None = 固定用构造参数
+        self._scope = scope
+        # 子代理执行器：Kernel 注入，经 ToolContext.run_subagent 暴露给 agents 扩展
+        self._subagent = subagent
+        # token 预算：>0 时用 provider 返回的 usage 校准「每 token 多少字符」，换算压缩阈值
+        self._token_budget = max(0, int(token_budget or 0))
+        self._chars_per_token = 3.0
         self._tools = tools
         self._context = context
         self._events = events
@@ -118,7 +239,8 @@ class AgentLoop:
             os_sandbox_mode=getattr(policy, "os_sandbox", "off"),
         )
         self._compactor = (
-            Compactor(provider, budget_chars=compact_budget)
+            # 压缩摘要可以交给更便宜的 fast 角色模型（ADR 0011）
+            Compactor(compact_provider or provider, budget_chars=compact_budget)
             if compact_budget and compact_budget > 0
             else None
         )
@@ -140,7 +262,13 @@ class AgentLoop:
         last_usage: dict[str, int] = {}
         call_signatures: dict[tuple[str, str], int] = {}
         denial_streak = 0
+        reminded = False
         result = TurnResult(session_id=session.id)
+        started = time.monotonic()
+        # 本回合所有模型调用的累计 usage；_complete 每次调用都往里加
+        session_usage = {"tokens_in": 0, "tokens_out": 0, "tokens_cached": 0}
+        # 子代理在同一个任务里嵌套运行：结束后必须恢复外层回合的累计
+        usage_token = _TURN_USAGE.set(session_usage)
 
         def deliver(chunk: str) -> None:
             """记录已交付给调用方的流式文本；异常时用它兜底 TurnResult.text。"""
@@ -185,6 +313,20 @@ class AgentLoop:
                     EventName.AFTER_PROVIDER_RESPONSE, session=session, reply=reply
                 )
 
+                if (
+                    not reply.tool_calls
+                    and self._cfg.verify_reminder
+                    and not reminded
+                    and steps < self._cfg.max_steps - 1
+                    and _needs_verification(session)
+                ):
+                    # 不结束回合：把提醒作为一条用户消息写回会话，让模型先验证（只提醒一次）
+                    reminded = True
+                    session.append_assistant(reply.text)
+                    session.append_user(VERIFY_REMINDER.format(files=_changed_files(session)))
+                    self._log("INFO", "验证提醒", session=session.id)
+                    self._status("提醒：改动尚未验证，继续运行测试/检查")
+                    continue
                 if not reply.tool_calls:
                     session.append_assistant(reply.text)
                     text = reply.text.strip()
@@ -261,12 +403,30 @@ class AgentLoop:
                     usage=last_usage,
                 )
                 self._log("WARN", "max steps reached", session=session.id)
+        except asyncio.CancelledError:
+            # 只吞掉 Kernel.cancel() 发起的取消；进程退出、Ctrl-C 等外部取消照常向上抛
+            if not getattr(session, "cancel_requested", False):
+                raise
+            session.cancel_requested = False
+            task = asyncio.current_task()
+            if task is not None and hasattr(task, "uncancel"):
+                task.uncancel()
+            result = TurnResult(
+                text="".join(delivered).strip(),
+                tool_calls=tool_calls_made,
+                stopped_reason="cancelled",
+                error="已被用户取消",
+                session_id=session.id,
+                usage=last_usage,
+            )
+            self._log("WARN", "回合被取消", session=session.id, steps=steps)
         except Exception as exc:  # noqa: BLE001 - 顶层必须兜住
             result = TurnResult(
                 # 流式阶段已经交付给用户的文本不能因为随后报错而丢掉。
                 text="".join(delivered).strip(),
                 tool_calls=tool_calls_made,
-                stopped_reason="error",
+                # 内容审核拒绝且恢复失败：单独标出，Kernel 会换新会话避免该会话永久不可用
+                stopped_reason="moderation" if isinstance(exc, ContentRejectedError) else "error",
                 error=describe_error(exc),
                 session_id=session.id,
                 usage=last_usage,
@@ -278,9 +438,26 @@ class AgentLoop:
                 getattr(self._provider, "name", "-"),
             )
         finally:
+            _TURN_USAGE.reset(usage_token)
+            result.total_usage = dict(session_usage)
             await self._events.emit(EventName.TURN_END, session=session, result=result)
             if self._logs:
                 self._logs.end_turn(session.id, result.text, error=result.error)
+                cron = (getattr(session, "metadata", None) or {}).get("cron") or {}
+                self._logs.event(
+                    "turn",
+                    session=session.id,
+                    turn_kind="cron" if cron else ("chat" if session.persists_events else "local"),
+                    job=cron.get("job_id") if cron else None,
+                    stopped_reason=result.stopped_reason,
+                    steps=steps,
+                    tool_calls=tool_calls_made,
+                    duration_ms=int((time.monotonic() - started) * 1000),
+                    error_class=(
+                        result.stopped_reason if result.stopped_reason != "completed" else None
+                    ),
+                    **session_usage,
+                )
         return result
 
     @staticmethod
@@ -424,7 +601,9 @@ class AgentLoop:
                 )
                 removed = await self._remove_rejected_messages(session)
                 if not removed:
-                    raise ProviderError(
+                    # 仍归为审核拒绝：Kernel 据此换新会话，否则这条触发内容留在历史里，
+                    # 该会话之后的每一轮都会被拒（ADR 0011）
+                    raise ContentRejectedError(
                         "上游内容安全策略拒绝了请求，且未在历史消息中定位到触发内容；"
                         "可能是本轮输入本身被拦截，请修改后重试。原错误：" + describe_error(exc)
                     ) from exc
@@ -499,8 +678,10 @@ class AgentLoop:
 
     async def _probe(self, text: str) -> bool:
         """返回 True 表示该内容能被上游接受；探测本身出错时不误删。"""
+        # 主备切换时只用主模型探测：备用模型接受不代表主模型接受
+        provider = getattr(self._provider, "primary", None) or self._provider
         try:
-            await self._provider.complete(
+            await provider.complete(
                 {"messages": [{"role": "user", "content": text}], "max_tokens": 8}
             )
             return True
@@ -517,9 +698,11 @@ class AgentLoop:
         started = time.monotonic()
         try:
             if on_delta is None:
-                return await self._provider.complete(payload)
-            return await self._provider.complete(payload, on_delta=on_delta)
+                reply = await self._provider.complete(payload)
+            else:
+                reply = await self._provider.complete(payload, on_delta=on_delta)
         except Exception as exc:  # noqa: BLE001 - 交给顶层统一记录并结束本回合
+            self._provider_event(started, None, exc)
             error = describe_error(exc)
             self._log(
                 "ERROR",
@@ -532,6 +715,53 @@ class AgentLoop:
                 # 失败的请求也要留档，否则交互日志里只剩一个空回合
                 self._logs.exchange(session_id, payload, None, error=error)
             raise
+        turn_usage = _TURN_USAGE.get()
+        if turn_usage is not None:
+            add_usage(turn_usage, reply.usage)
+        self._calibrate(payload, reply)
+        self._provider_event(started, reply, None)
+        return reply
+
+    @property
+    def chars_per_token(self) -> float:
+        return self._chars_per_token
+
+    def _calibrate(self, payload: dict[str, Any], reply: Any) -> None:
+        """用真实的输入 token 数校准字符/token 比例，并据此调整压缩阈值（ADR 0013）。"""
+        if not self._token_budget:
+            return
+        tokens = normalize_usage(getattr(reply, "usage", None))["tokens_in"]
+        chars = estimate_chars(payload)
+        if tokens < 200 or chars < 500:
+            return
+        ratio = max(1.0, min(6.0, chars / tokens))
+        self._chars_per_token = 0.7 * self._chars_per_token + 0.3 * ratio
+        budget = int(self._token_budget * self._chars_per_token)
+        if self._compactor is not None and abs(budget - self._compactor.budget_chars) > 1000:
+            self._compactor.resize(budget)
+            if hasattr(self._context, "budget_chars"):
+                self._context.budget_chars = budget
+
+    def _scoped(self) -> tuple[Any, Any]:
+        if self._scope is not None:
+            try:
+                return self._scope()
+            except Exception:  # noqa: BLE001 - 解析失败退回默认工作区
+                _logger.exception("回合工作区解析失败，使用默认工作区")
+        return self._policy, self._env
+
+    def _provider_event(self, started: float, reply: Any, exc: BaseException | None) -> None:
+        if not self._logs:
+            return
+        usage = normalize_usage(getattr(reply, "usage", None) if reply is not None else None)
+        self._logs.event(
+            "provider",
+            model=str(getattr(self._provider, "last_used", "") or getattr(self._provider, "name", "-")),
+            ok=exc is None,
+            latency_ms=int((time.monotonic() - started) * 1000),
+            error_class=classify_provider_error(exc) or None,
+            **usage,
+        )
 
     async def _execute_tools(
         self,
@@ -550,10 +780,22 @@ class AgentLoop:
             slots[index] = await self._execute_one(session, call, signatures)
 
         if self._cfg.parallel_tools:
+            # 只读/无副作用的调用并发执行；写文件、执行命令等串行（ADR 0012）
+            serial = [
+                index for index, call in enumerate(calls) if not self._concurrency_safe(call)
+            ]
             tasks = [
                 asyncio.create_task(one(index, call))
                 for index, call in enumerate(calls)
+                if index not in serial
             ]
+
+            async def run_serial() -> None:
+                for index in serial:
+                    await one(index, calls[index])
+
+            if serial:
+                tasks.append(asyncio.create_task(run_serial()))
             try:
                 await asyncio.gather(*tasks)
             except BaseException:
@@ -565,7 +807,33 @@ class AgentLoop:
             for index, call in enumerate(calls):
                 slots[index] = await self._execute_one(session, call, signatures)
 
+    def _concurrency_safe(self, call: Any) -> bool:
+        tool = self._tools.get(call.name)
+        check = getattr(tool, "is_concurrency_safe", None)
+        return bool(check()) if callable(check) else True
+
     async def _execute_one(self, session, call, signatures: dict[tuple[str, str], int]) -> ToolResult:
+        started = time.monotonic()
+        result = await self._execute_one_inner(session, call, signatures)
+        if self._logs:
+            self._logs.event(
+                "tool",
+                session=session.id,
+                tool=call.name,
+                ok=not result.is_error,
+                latency_ms=int((time.monotonic() - started) * 1000),
+                error_class=classify_tool_error(result) if result.is_error else None,
+            )
+        return result
+
+    async def _execute_one_inner(
+        self, session, call, signatures: dict[tuple[str, str], int]
+    ) -> ToolResult:
+        try:
+            # 供 /status 查询「正在调用哪个工具」
+            session.current_tool = call.name
+        except AttributeError:
+            pass
         self._log("INFO", "tool call", session=session.id, tool=call.name)
         self._status(f"调用工具 {call.name}")
 
@@ -609,7 +877,8 @@ class AgentLoop:
             self._status(f"工具被拦截 {call.name}")
             return ToolResult.error(event.block_reason or "blocked by extension", denied=True)
 
-        decision = self._policy.check(tool, call.args)
+        policy, env = self._scoped()
+        decision = policy.check(tool, call.args)
         if not decision.allowed:
             self._log(
                 "WARN",
@@ -623,21 +892,24 @@ class AgentLoop:
 
         ctx = KernelToolContext(
             session=session,
-            policy=self._policy,
+            policy=policy,
             secrets=self._secrets,
             ui=self._current_ui(),
-            env=self._env,
+            env=env,
+            subagent=self._subagent,
+            vision=self._vision,
         )
+        ctx.main_vision = bool(getattr(self._context, "vision", False))
         if decision.requires_confirmation:
             approved = await ctx.confirm(
                 f"确认执行工具 {tool.name}",
-                json.dumps(call.args, ensure_ascii=False)[:800],
+                confirm_preview(call.args),
             )
             if not approved:
                 return ToolResult.error(
                     f"permission denied: 用户未确认执行 {tool.name}。"
-                    "如需授权：在 config.toml 的 [permissions].allow_exec 在聊天中发送 /allow <程序名>中按程序名放行"
-                    "（无人值守的定时任务没有确认对象，必须静态放行）",
+                    "如需免确认：在 config.toml 的 [permissions].allow_exec 中添加程序名，"
+                    "或在聊天中发送 /allow <程序名>（无人值守的定时任务没有确认对象，必须静态放行）",
                     denied=True,
                 )
 
@@ -647,11 +919,14 @@ class AgentLoop:
             return ToolResult.error(f"invalid arguments for {tool.name}: {exc}")
 
         try:
-            outcome = tool.handler(ctx, args)
-            if inspect.isawaitable(outcome):
-                result = await asyncio.wait_for(outcome, timeout=tool.timeout_s)
+            if inspect.iscoroutinefunction(tool.handler):
+                result = await asyncio.wait_for(tool.handler(ctx, args), timeout=tool.timeout_s)
             else:
-                result = outcome
+                # 同步 handler 放进独立线程：直接调用会阻塞事件循环，超时也无从生效
+                result = await asyncio.wait_for(
+                    run_sync_handler(tool.handler, ctx, args, name=tool.name),
+                    timeout=tool.timeout_s,
+                )
             if not isinstance(result, ToolResult):
                 result = ToolResult(content=str(result))
         except asyncio.TimeoutError:
@@ -677,4 +952,11 @@ class AgentLoop:
         return result
 
 
-__all__ = ["AgentLoop", "LoopConfig", "TurnResult"]
+__all__ = [
+    "AgentLoop",
+    "LoopConfig",
+    "TurnResult",
+    "add_turn_usage",
+    "confirm_preview",
+    "run_sync_handler",
+]

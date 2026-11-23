@@ -100,8 +100,14 @@ class KernelToolContext:
         secrets: Mapping[str, str] | None = None,
         ui: UI | None = None,
         env: ExecutionEnvironment | None = None,
+        subagent: Any = None,
+        vision: Any = None,
     ) -> None:
         self.session = session
+        self._subagent = subagent
+        self._vision = vision
+        # 主模型能否直接看图（AgentLoop 按 ContextBuilder.vision 设置；ADR 0015）
+        self.main_vision = False
         self.policy = policy
         self.env = env or LocalExecution(
             policy.root,
@@ -110,6 +116,30 @@ class KernelToolContext:
         )
         self._secrets = secrets or {}
         self._ui = ui or NullUI()
+
+    async def run_subagent(
+        self, prompt: str, *, tools: list[str], max_steps: int = 20, label: str = "sub"
+    ) -> dict[str, Any]:
+        """在独立子会话里运行一个子代理，只返回结果摘要（ADR 0013）。"""
+        if self._subagent is None:
+            raise RuntimeError("当前环境不支持子代理")
+        return await self._subagent(
+            self.session, prompt, tools=tools, max_steps=max_steps, label=label
+        )
+
+    async def describe_image(self, path: str, question: str = "") -> str:
+        """交给视觉模型描述图片（ADR 0015）；没有可用的视觉模型时抛 RuntimeError。"""
+        if self._vision is None:
+            raise RuntimeError("当前环境没有可用的视觉模型")
+        return await self._vision(path, question)
+
+    @property
+    def vision_available(self) -> bool:
+        return self._vision is not None
+
+    def secret_names(self) -> list[str]:
+        """已配置的密钥名（只有名字，没有值），供定时任务预检等使用。"""
+        return sorted(name for name, value in self._secrets.items() if value)
 
     def secret(self, name: str) -> str:
         value = self._secrets.get(name)

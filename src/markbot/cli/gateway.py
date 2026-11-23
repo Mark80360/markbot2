@@ -2,7 +2,8 @@
 
 命令：
 
-    markbot gateway start
+    markbot gateway start      后台启动（脱离终端）
+    markbot gateway run        前台运行并守护子进程（systemd / 计划任务用，ADR 0010）
     markbot gateway stop
     markbot gateway restart
     markbot gateway status
@@ -26,7 +27,12 @@ from pathlib import Path
 from typing import Any
 
 from markbot.kernel import gateway_log
-from markbot.kernel.config import markbot_home
+from markbot.kernel.config import (
+    PlaintextSecretsError,
+    enforce_secret_policy,
+    load_config,
+    markbot_home,
+)
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8787
@@ -258,8 +264,24 @@ def _fail(home: Path, message: str) -> int:
     return 1
 
 
+def _secret_policy_error() -> str | None:
+    """serve 子进程启动前先做明文密钥检查，直接给出可读的错误而不是只留日志尾巴。"""
+    try:
+        cfg = load_config()
+        enforce_secret_policy(cfg)
+    except PlaintextSecretsError as exc:
+        return str(exc)
+    except (OSError, ValueError):
+        return None  # 配置读取问题交给 serve 自己报告
+    return None
+
+
 def start(argv: list[str]) -> int:
     home = markbot_home()
+    blocked = _secret_policy_error()
+    if blocked:
+        print(f"error: {blocked}", file=sys.stderr)
+        return 2
     state = _read_state(home)
     if _alive_pids(state):
         print("gateway 已在运行，可用 `markbot gateway status` 查看或 `markbot gateway restart` 重启。")
@@ -314,12 +336,189 @@ def start(argv: list[str]) -> int:
     return 0
 
 
+# ------------------------------------------------------------------ 前台守护
+RESTART_BACKOFF_S = 5.0
+MAX_RESTART_BACKOFF_S = 300.0
+STABLE_AFTER_S = 600.0
+
+
+def _spawn_child(target: list[str], log_file: Path) -> subprocess.Popen:
+    """前台守护模式的子进程：不脱离父进程（父进程被 systemd/计划任务停止时一起结束）。"""
+    env = dict(os.environ)
+    env["PYTHONUTF8"] = "1"
+    env["PYTHONIOENCODING"] = "utf-8"
+    env["PYTHONUNBUFFERED"] = "1"
+    env.setdefault("MARKBOT_HOME", str(markbot_home()))
+    args = [sys.executable, "-c", _LAUNCHER, str(log_file), *target]
+    kwargs: dict[str, Any] = {
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
+        "env": env,
+    }
+    if os.name == "nt":
+        kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW
+    return subprocess.Popen(args, **kwargs)
+
+
+class _Child:
+    def __init__(self, name: str, target: list[str]) -> None:
+        self.name = name
+        self.target = target
+        self.proc: subprocess.Popen | None = None
+        self.started_at = 0.0
+        self.backoff = RESTART_BACKOFF_S
+        self.next_start = 0.0
+        self.restarts = 0
+
+
+def run(argv: list[str]) -> int:
+    """前台运行 serve 与飞书渠道，子进程退出后按指数退避自动拉起。
+
+    给 systemd（Restart=always）或 Windows 计划任务托管用：本进程是唯一的长期进程，
+    收到 SIGTERM / Ctrl-C 时先停渠道再停 serve（serve 会优雅停机）。
+    """
+    home = markbot_home()
+    blocked = _secret_policy_error()
+    if blocked:
+        print(f"error: {blocked}", file=sys.stderr)
+        return 2
+    state = _read_state(home)
+    if _alive_pids(state) or _is_alive(int((state.get("supervisor") or {}).get("pid") or 0)):
+        print("gateway 已在运行（可能由 `gateway start` 或其它守护进程启动）。", file=sys.stderr)
+        return 1
+    gateway_dir(home).mkdir(parents=True, exist_ok=True)
+    log_file = log_path(home)
+    log_line(home, "=== gateway run (foreground supervisor) ===")
+    children = [
+        _Child(
+            "server",
+            ["-m", "markbot", "serve", "--host", DEFAULT_HOST, "--port", str(DEFAULT_PORT)],
+        )
+    ]
+    app_id = _feishu_app_id(home)
+    script = _channel_script() if app_id else None
+    if script is not None:
+        children.append(_Child("channel", [str(script)]))
+    stopping = {"flag": False}
+
+    def request_stop(*_args: Any) -> None:
+        stopping["flag"] = True
+
+    for name in ("SIGTERM", "SIGINT", "SIGBREAK", "SIGHUP"):
+        sig = getattr(signal, name, None)
+        if sig is not None:
+            try:
+                signal.signal(sig, request_stop)
+            except (OSError, ValueError):
+                pass
+
+    def save_state() -> None:
+        current: dict[str, Any] = {
+            "started_at": _now(),
+            "log": str(log_file),
+            "mode": "foreground",
+            "managed_by": "systemd" if os.environ.get("INVOCATION_ID") else "",
+            "supervisor": {"pid": os.getpid()},
+        }
+        for child in children:
+            if child.proc is not None:
+                entry: dict[str, Any] = {"pid": child.proc.pid, "restarts": child.restarts}
+                if child.name == "server":
+                    entry.update(host=DEFAULT_HOST, port=DEFAULT_PORT)
+                else:
+                    entry["script"] = str(script)
+                current[child.name] = entry
+        _write_state(home, current)
+
+    try:
+        while not stopping["flag"]:
+            now = time.time()
+            changed = False
+            for child in children:
+                proc = child.proc
+                if proc is not None and proc.poll() is None:
+                    if now - child.started_at > STABLE_AFTER_S:
+                        child.backoff = RESTART_BACKOFF_S
+                    continue
+                if proc is not None:
+                    log_line(
+                        home,
+                        f"{child.name} 退出 code={proc.returncode}，{child.backoff:.0f}s 后重启",
+                    )
+                    child.proc = None
+                    child.next_start = now + child.backoff
+                    child.backoff = min(MAX_RESTART_BACKOFF_S, child.backoff * 2)
+                    child.restarts += 1
+                    changed = True
+                    continue
+                if now < child.next_start:
+                    continue
+                if child.name == "channel" and _health() is None:
+                    continue  # 渠道依赖 serve：等 serve 就绪
+                child.proc = _spawn_child(child.target, log_file)
+                child.started_at = now
+                log_line(home, f"启动 {child.name} pid={child.proc.pid}")
+                changed = True
+            if changed:
+                save_state()
+            time.sleep(1.0)
+    finally:
+        log_line(home, "=== gateway run 停止 ===")
+        for child in reversed(children):
+            if child.proc is not None and child.proc.poll() is None:
+                _terminate(child.proc)
+        _clear_state(home)
+    return 0
+
+
+def _terminate(proc: subprocess.Popen, timeout_s: float = 75.0) -> None:
+    """先礼后兵：POSIX 发 SIGTERM（serve 会优雅停机），超时再杀进程树。"""
+    try:
+        if os.name == "nt":
+            # 无控制台的子进程不一定收得到 CTRL_BREAK：等待时间短一些，再强制结束进程树
+            proc.send_signal(signal.CTRL_BREAK_EVENT)  # type: ignore[attr-defined]
+            timeout_s = min(timeout_s, 20.0)
+        else:
+            proc.terminate()
+        proc.wait(timeout=timeout_s)
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        if os.name == "nt":
+            _kill_tree(proc.pid)
+        else:
+            try:
+                proc.kill()
+            except OSError:
+                pass
+
+
 def stop(argv: list[str]) -> int:
     home = markbot_home()
     state = _read_state(home)
     if not state:
         print("gateway 未运行。")
         return 1
+    if state.get("managed_by") == "systemd":
+        print("gateway 由 systemd 管理，请运行：systemctl --user stop markbot", file=sys.stderr)
+        return 1
+    supervisor = int((state.get("supervisor") or {}).get("pid") or 0)
+    if supervisor and _is_alive(supervisor):
+        # 前台守护模式：通知守护进程退出，由它按顺序停止子进程
+        log_line(home, "=== gateway stop (supervisor) ===")
+        if os.name == "nt":
+            _kill_tree(supervisor)
+        else:
+            try:
+                os.kill(supervisor, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            for _ in range(320):
+                if not _is_alive(supervisor):
+                    break
+                time.sleep(0.25)
+        _clear_state(home)
+        print("gateway 已停止。")
+        return 0
 
     log_line(home, "=== gateway stop ===")
     for key, label in (("channel", "feishu 渠道"), ("server", "markbot serve")):
@@ -378,6 +577,7 @@ def status(argv: list[str]) -> int:
 
 ACTIONS = {
     "start": start,
+    "run": run,
     "stop": stop,
     "restart": restart,
     "status": status,
@@ -387,6 +587,6 @@ ACTIONS = {
 def gateway_command(argv: list[str]) -> int:
     action = argv[0] if argv else "status"
     if action not in ACTIONS:
-        print("用法: markbot gateway start|stop|restart|status", file=sys.stderr)
+        print("用法: markbot gateway start|run|stop|restart|status", file=sys.stderr)
         return 2
     return ACTIONS[action](argv[1:])

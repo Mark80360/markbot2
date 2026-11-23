@@ -119,11 +119,26 @@ class PathGuard:
             return False
         return len(parts) >= 2 and parts[1] == "files"
 
+    def _scratch(self, path: Path) -> Path | None:
+        """``<home>/sessions/<id>/scratch/**``：会话临时目录，可读写（ADR 0012）。"""
+        if self.home is None:
+            return None
+        try:
+            parts = path.relative_to(self.home / "sessions").parts
+        except ValueError:
+            return None
+        if len(parts) >= 2 and parts[1] == "scratch":
+            return self.home / "sessions" / parts[0] / "scratch"
+        return None
+
     def carve_out(self, path: Path, *, write: bool) -> Path | None:
         """命中例外目录时返回该目录，否则 ``None``。"""
         for base in self.writable:
             if _within(path, base):
                 return base
+        scratch = self._scratch(path)
+        if scratch is not None:
+            return scratch
         if not write:
             for base in self.readable:
                 if _within(path, base):

@@ -1,0 +1,5 @@
+prompt: |
+  打开 {base_url}/index.html ，页面里的商品价格表是 JavaScript 动态生成的。
+  告诉我价格最低的商品名称和它的价格。
+expect: ["Gamma", "12.5"]
+max_steps: 12

@@ -236,6 +236,10 @@ class CompactionOutcome:
 class Compactor:
     def __init__(self, provider: Provider, *, budget_chars: int = 60_000) -> None:
         self.provider = provider
+        self.resize(budget_chars)
+
+    def resize(self, budget_chars: int) -> None:
+        """按新的字符预算重算阈值（token 预算校准后调用；ADR 0013）。"""
         self.budget_chars = max(2000, int(budget_chars))
         self.trigger_chars = int(self.budget_chars * TRIGGER_RATIO)
         self.keep_chars = max(MIN_KEEP_CHARS, int(self.budget_chars * KEEP_RATIO))
@@ -255,6 +259,11 @@ class Compactor:
             # 切进了当前回合：用户这一轮的原始请求会被摘要掉，原文附在摘要后，避免目标走样
             request = _truncate(session.messages[request_index].content, CURRENT_REQUEST_MAX_CHARS)
             summary = f"{summary.rstrip()}\n\n## 当前请求原文\n{request}"
+        todos = getattr(session, "todos", None) or []
+        if todos:
+            # 任务清单原样保留（每轮也会注入系统提示；这里让摘要本身自洽）
+            rows = "\n".join(f"- [{item.get('status')}] {item.get('content')}" for item in todos)
+            summary = f"{summary.rstrip()}\n\n## 任务清单\n{rows}"
         session.apply_compaction(summary, cut)
         return CompactionOutcome(
             before=before,

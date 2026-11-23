@@ -1,0 +1,3 @@
+prompt: |
+  tests/test_listutil.py 里的测试失败了。请找到 listutil.py 里的缺陷并修复，然后运行测试确认全部通过。不要修改测试。
+allowed: ["listutil.py"]

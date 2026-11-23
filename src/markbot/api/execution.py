@@ -52,6 +52,10 @@ class ExecutionEnvironment(Protocol):
     #                     timeout_s: float = 30.0, env: Mapping[str, str] | None = None,
     #                     readable: tuple[Path, ...] = ()) -> ProcessResult: ...
     # ``readable`` 为本次额外只读开放的目录（OS 级隔离开启时生效），调用方负责保证可信。
+    #
+    # 可选（ADR 0012）：read_bytes(raw) -> bytes；write_bytes(raw, data, *, create_dirs=True)
+    # -> Path（原子写）；delete(raw) -> Path；spawn(command, *, cwd=None, env=None) -> Popen
+    # （后台进程，stdin/stdout 管道）。扩展用 getattr 判断，缺失时退回 read_text/write_text。
 
 
 __all__ = ["ExecutionEnvironment"]

@@ -183,11 +183,15 @@ def test_memory_index_capacity_uses_rendered_size(tmp_path):
 
 
 def test_memory_index_full_message_is_actionable(tmp_path):
+    # 非永久页面会被自动整理出索引（ADR 0009，见 test_phase0_hardening）；
+    # 全是永久页面、无法整理时才拒绝，并给出可执行的提示
     store = MemoryStore(tmp_path / "learned")
     long = "非常长的摘要" * 30
     receipt = None
     for index in range(60):
-        receipt = store.remember(f"{long}{index}", target="wiki", topic=f"t{index:02d}")
+        receipt = store.remember(
+            f"{long}{index}", target="wiki", topic=f"t{index:02d}", lifespan="permanent"
+        )
         if not receipt.ok:
             break
     assert receipt is not None and not receipt.ok

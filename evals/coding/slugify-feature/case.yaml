@@ -1,0 +1,4 @@
+prompt: |
+  在 textutil.py 里实现 slugify(text)：转小写；连续的非字母数字字符替换为单个短横线；去掉首尾短横线。
+  具体要求以 tests/test_textutil.py 为准。实现后运行测试确认全部通过。
+allowed: ["textutil.py"]

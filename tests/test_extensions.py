@@ -111,8 +111,23 @@ def test_shell_run_command_success_and_failure(tmp_path):
 # --------------------------------------------------------------------- web
 
 
+@pytest.fixture(autouse=True)
+def _offline_dns(monkeypatch):
+    """fetch_url 会先解析目标地址做 SSRF 检查；测试里不访问真实 DNS。"""
+    import ipaddress
+
+    async def resolve(host, port):
+        try:
+            return [ipaddress.ip_address(host)]
+        except ValueError:
+            return [ipaddress.ip_address("93.184.216.34")]
+
+    monkeypatch.setattr(web, "_resolve_host", resolve)
+
+
 def test_web_url_normalization_and_text_extraction():
-    assert web._normalize_url("example.com/a") == "http://example.com/a"
+    # 省略协议头时先试 https（ADR 0009），连接失败再退回 http
+    assert web._normalize_url("example.com/a") == "https://example.com/a"
     assert web._normalize_url("https://example.com") == "https://example.com"
     assert web._normalize_url("ftp://example.com") is None
 
@@ -150,7 +165,7 @@ def test_web_fetch_success_cleans_html(monkeypatch):
     assert not result.is_error
     assert "Hello web" in result.content
     assert "bad()" not in result.content
-    assert result.details["url"] == "http://example.com"
+    assert result.details["url"] == "https://example.com"
 
 
 def test_web_fetch_reports_http_and_network_errors(monkeypatch):

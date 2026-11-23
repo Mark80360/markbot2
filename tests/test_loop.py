@@ -230,9 +230,11 @@ def test_moderation_rejection_without_offending_context_errors(make_kernel):
     provider = Always()
     kernel = make_kernel(provider=provider)
     result = asyncio.run(kernel.run("hi"))
-    assert result.stopped_reason == "error"
+    # 定位不到触发内容时按审核拒绝结束，并自动换到带摘要的新会话（ADR 0011）
+    assert result.stopped_reason == "moderation"
     assert "内容安全策略" in (result.error or "")
     assert provider.calls == 1
+    assert "新会话" in result.text
 
 
 def test_max_steps(make_kernel):

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from markbot.api.media import image_block
 from markbot.kernel.providers.base import (
     DeltaCallback,
     ModelReply,
@@ -87,13 +88,51 @@ class OpenAICompatProvider:
         )
 
 
+def _image_parts(paths: list[str]) -> tuple[list[dict[str, Any]], list[str]]:
+    """图片 -> Chat Completions 的 image_url 片段；读取失败的路径单独返回，改用文字说明。"""
+    parts: list[dict[str, Any]] = []
+    failed: list[str] = []
+    for path in paths:
+        block = image_block(path)
+        if block is None:
+            failed.append(path)
+            continue
+        kind, data = block
+        parts.append({"type": "image_url", "image_url": {"url": f"data:{kind};base64,{data}"}})
+    return parts, failed
+
+
+def _with_images(text: str, paths: list[str]) -> Any:
+    parts, failed = _image_parts(paths)
+    if failed:
+        text = (text + "\n" + "\n".join(f"[图片 {path} 无法读取]" for path in failed)).strip()
+    if not parts:
+        return text
+    return [{"type": "text", "text": text or "（图片）"}, *parts]
+
+
 def _messages(payload: dict[str, Any]) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     system = payload.get("system")
     if system:
         out.append({"role": "system", "content": system})
+    # Chat Completions 的 tool 消息只能是文本：工具返回的图片在这一串 tool 消息之后
+    # 以一条 user 消息补上（必须紧跟全部 tool 结果，否则调用/结果配对会被打断）
+    pending: list[tuple[str, list[str]]] = []
+
+    def flush() -> None:
+        if not pending:
+            return
+        names = "、".join(dict.fromkeys(name for name, _ in pending))
+        paths = [path for _, images in pending for path in images]
+        content = _with_images(f"[工具 {names} 返回的图片]", paths)
+        out.append({"role": "user", "content": content})
+        pending.clear()
+
     for msg in payload.get("messages", []):
         role = msg.get("role")
+        if role != "tool":
+            flush()
         if role == "assistant" and msg.get("tool_calls"):
             out.append(
                 {
@@ -120,8 +159,13 @@ def _messages(payload: dict[str, Any]) -> list[dict[str, Any]]:
                     "content": msg.get("content", ""),
                 }
             )
+            if msg.get("images"):
+                pending.append((str(msg.get("name") or "tool"), list(msg["images"])))
+        elif role == "user" and msg.get("images"):
+            out.append({"role": "user", "content": _with_images(msg.get("content", ""), list(msg["images"]))})
         else:
             out.append({"role": role, "content": msg.get("content", "")})
+    flush()
     return out
 
 

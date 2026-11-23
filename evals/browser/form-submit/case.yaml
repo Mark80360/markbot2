@@ -1,0 +1,5 @@
+prompt: |
+  打开 {base_url}/form.html ，姓名填「李雷」，套餐选「专业版」，然后点击「生成」按钮，
+  把页面上显示的激活码原样告诉我。
+expect: ["MB-7319"]
+max_steps: 15

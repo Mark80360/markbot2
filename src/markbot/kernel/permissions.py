@@ -26,8 +26,11 @@ NET = "net"
 EXEC = "exec"
 SECRET = "secret"
 UI = "ui"
+# 浏览器与桌面控制（ADR 0014）：browser:<域名|*>、desktop:<应用|*>
+BROWSER = "browser"
+DESKTOP = "desktop"
 
-_KINDS = {FS_READ, FS_WRITE, NET, EXEC, SECRET, UI}
+_KINDS = {FS_READ, FS_WRITE, NET, EXEC, SECRET, UI, BROWSER, DESKTOP}
 _PATH_KEYS = {"path", "paths", "file", "files", "dir", "directory", "target", "src", "dest", "cwd"}
 _URL_KEYS = {"url", "urls", "host", "hosts"}
 _EXEC_KEYS = {"command", "program", "cmd"}
@@ -127,8 +130,10 @@ def capability_covers(parent: Capability, child: Capability) -> bool:
                 return not _is_absolute_pattern(child.value)
             return _normalize(child.value).startswith(prefix + "/")
         return glob_match(parent.value, child.value)
-    if parent.kind == NET:
+    if parent.kind in {NET, BROWSER}:
         return child.value == parent.value or child.value.endswith("." + parent.value)
+    if parent.kind == DESKTOP:
+        return child.value.lower() == parent.value.lower()
     if parent.kind == EXEC:
         return child.value == parent.value or child.value.startswith(parent.value + " ")
     return False
@@ -407,11 +412,28 @@ class PermissionPolicy:
                     needs_confirm = self.trusted_exec != "all" and not pinned
                 else:
                     needs_confirm = self.confirm_on_exec
-                if needs_confirm and not self._exec_exempt(args, keys):
+                # 能力钉死程序（exec:git）且该程序在放行名单里：standard 档位也免确认（ADR 0013）
+                pinned_exempt = (
+                    cap.value != "*"
+                    and not _values(args, keys.command)
+                    and not _programs(args, keys.program)
+                    and self._program_exempt(cap.value.split(" ", 1)[0])
+                )
+                if needs_confirm and not pinned_exempt and not self._exec_exempt(args, keys):
                     return Decision(True, "执行命令需确认", requires_confirmation=True)
             elif cap.kind == SECRET:
                 if self.profile == "strict":
                     return Decision(False, "strict 模式禁止读取密钥")
+            elif cap.kind in {BROWSER, DESKTOP}:
+                # 具体动作（点击、输入、提交）的确认由工具自己按风险判断；这里只按档位总开关
+                if self.profile == "strict":
+                    label = "浏览器" if cap.kind == BROWSER else "桌面"
+                    return Decision(False, f"strict 模式禁止{label}控制")
+                if cap.kind == BROWSER and cap.value != "*":
+                    for raw in _values(args, keys.url):
+                        host = _host_of(raw)
+                        if host and host != cap.value and not host.endswith("." + cap.value):
+                            return Decision(False, f"浏览器访问不在能力范围内: {host}")
         return Decision(True)
 
     def _path_allowed(self, cap: Capability, raw_path: str) -> bool:
@@ -515,6 +537,19 @@ _INLINE_INTERPRETER = re.compile(
     r"(?:-[A-Za-z]*[ce]\b|--eval\b|-\s|-$)"
 )
 _DECODE_PIPE = re.compile(r"\b(?:base64|xxd|openssl)\b[^|]*\s(?:-d|-D|--decode|-r)\b")
+# 会丢失工作或改写共享历史的 git 操作：与放行名单无关，一律确认（ADR 0013）
+_DANGEROUS_GIT = re.compile(
+    r"\bgit\b[^;&|]*\s(?:"
+    r"push\b[^;&|]*(?:\s--force\b|\s-f\b|\s--force-with-lease\b|\s--delete\b|\s:\S)"
+    r"|reset\b[^;&|]*\s--hard\b"
+    r"|clean\b[^;&|]*\s-[a-zA-Z]*f"
+    r"|checkout\b[^;&|]*\s(?:--\s+\.|\.)(?:\s|$)"
+    r"|restore\b[^;&|]*\s\.(?:\s|$)"
+    r"|branch\b[^;&|]*\s-D\b"
+    r"|rebase\b|filter-branch\b|filter-repo\b|reflog\s+expire\b|gc\b[^;&|]*--prune"
+    r"|stash\s+(?:drop|clear)\b"
+    r")"
+)
 
 
 def _risky_reason(commands: list[str]) -> str | None:
@@ -530,6 +565,8 @@ def _risky_reason(commands: list[str]) -> str | None:
             return "命令以内联方式执行解释器代码（如 python -c / node -e）"
         if _DECODE_PIPE.search(command):
             return "命令先解码再处理内容（base64/xxd/openssl 解码）"
+        if _DANGEROUS_GIT.search(command):
+            return "命令包含可能丢失工作或改写历史的 git 操作（force push、reset --hard、clean -f、rebase 等）"
     return None
 
 
@@ -584,6 +621,8 @@ def _program_allowed(cap: Capability, program: str) -> bool:
 
 
 __all__ = [
+    "BROWSER",
+    "DESKTOP",
     "Capability",
     "CapabilityError",
     "Decision",

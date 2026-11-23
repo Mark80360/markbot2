@@ -1,0 +1,5 @@
+prompt: |
+  打开 {base_url}/login.html ，用户名填 demo，口令填 open-sesame，点击「登录」，
+  登录后告诉我页面上显示的账户余额。
+expect_any: ["3,280", "3280"]
+max_steps: 15

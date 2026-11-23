@@ -1,0 +1,5 @@
+<!doctype html><html lang="zh"><head><meta charset="utf-8"><title>账户</title></head><body>
+<h1>我的账户</h1><p id="b">加载中…</p>
+<script>
+document.getElementById("b").textContent = sessionStorage.getItem("auth")==="1" ? "账户余额：3,280.00 元" : "请先登录";
+</script></body></html>

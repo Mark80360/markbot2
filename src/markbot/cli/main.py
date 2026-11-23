@@ -13,13 +13,25 @@ import tomllib
 from pathlib import Path
 
 from markbot.api.ui import ConsoleUI, NullUI
+from markbot.cli.eval_cmd import eval_command
 from markbot.cli.gateway import gateway_command
 from markbot.cli.secrets_cmd import secrets_command
+from markbot.cli.service import service_command
 from markbot.cli.sessions_cmd import sessions_command
 from markbot.cron.cli import cron_command
 from markbot.kernel import gateway_log, local_auth
 from markbot.kernel.app import Kernel
-from markbot.kernel.config import Config, load_config, markbot_home
+from markbot.kernel.config import (
+    ALLOW_PLAINTEXT_ENV,
+    Config,
+    PlaintextSecretsError,
+    enforce_secret_policy,
+    load_config,
+    load_projects,
+    markbot_home,
+    save_project,
+    valid_project_name,
+)
 from markbot.kernel.permissions import parse_capabilities, uncovered_capabilities
 from markbot.kernel.providers import EchoProvider, ProviderError, build_provider
 from markbot.kernel.registry import discover_packages, package_manifest
@@ -60,16 +72,30 @@ HELP = """MarkBot —— 极薄 Kernel + 四条扩展车道
   markbot reload                重新合成运行时视图
   markbot cron list|add|run|history
                                 管理定时任务（调度器在 serve/gateway 进程里运行）
-  markbot optimize [--dry-run] [--k N] [--approve-skills]
+  markbot optimize [--dry-run] [--k N] [--approve-skills] [--gate-suites coding,browser]
   markbot rollback [--list] [--to HASH]
   markbot memory status|search|consolidate|restore
                                 查看、检索、整理与回滚长期记忆
   markbot serve [--port 8787] [--host 127.0.0.1] [--allow-remote]
-  markbot gateway start|stop|restart|status
+  markbot gateway start|run|stop|restart|status
+                                run = 前台守护模式（子进程退出自动拉起）
+  markbot project add <名称> <路径> | list | remove <名称>
+                                登记项目；聊天里 /project <名称> 切换，CLI 用 --project <名称>
+  markbot eval --suite coding|browser [--case 名称] [--json] [--keep] [--max-cases N]
+               [--record] [--fail-on-regression] [--baseline FILE] [--min-ratio X]
+                                评测：编码（evals/coding/ 小仓库 + 测试判分）、浏览器（evals/browser/）；
+                                --record 写入趋势，--fail-on-regression 与上次比较
+  markbot eval --trend [--suite coding]
+                                查看评测趋势（<home>/logs/optimizer.jsonl）
+  markbot stats [--days 7] [--json]
+                                按天统计回合、失败率、工具失败、token 与定时任务
+  markbot service install|uninstall|status [--dry-run]
+                                开机自启：Linux systemd 用户服务 / Windows 计划任务
   markbot sessions status|migrate [--dry-run]
                                 会话归档存储统计；清理可从 events.jsonl 重建的派生文件
   markbot secrets status|migrate [--dry-run]
                                 检查 / 迁移 config.toml 里的明文密钥到 secrets.toml（0600）
+  --allow-plaintext-secrets     全局选项：config.toml 含明文密钥时仍允许启动（临时放行）
                                 后台托管 HTTP 入口与飞书渠道（日志在 ~/.markbot/gateway/）
 
 配置：
@@ -102,10 +128,18 @@ def _build(
     inject_failure: str | None = None,
     require_provider: bool = True,
     gateway_logs: bool = False,
+    enforce_secrets: bool = False,
 ) -> Kernel | None:
     cfg = _load()
     if cfg is None:
         return None
+    if enforce_secrets:
+        # 对话/服务入口：config.toml 含明文密钥时拒绝启动（ADR 0009）
+        try:
+            enforce_secret_policy(cfg)
+        except PlaintextSecretsError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return None
     if isinstance(ui, ConsoleUI):
         ui.show_status = cfg.ui.show_progress
     if home is not None:
@@ -324,7 +358,7 @@ def cmd_init(argv: list[str]) -> int:
 
 # -------------------------------------------------------------------- commands
 def cmd_chat(argv: list[str]) -> int:
-    kernel = _build(ui=ConsoleUI(interactive=True))
+    kernel = _build(ui=ConsoleUI(interactive=True), enforce_secrets=True)
     if kernel is None:
         return 2
     _print_summary(kernel)
@@ -370,7 +404,7 @@ def cmd_chat(argv: list[str]) -> int:
                 result = asyncio.run(kernel.run_skill(name, extra.strip()))
         else:
             with run_lock:
-                result = asyncio.run(kernel.run(line, archive=False))
+                result = asyncio.run(kernel.run(line, archive=False, project=_PROJECT_FLAG[0]))
         if result.error:
             print(f"error: {result.error}", file=sys.stderr)
         if result.text:
@@ -486,9 +520,18 @@ def cmd_doctor(argv: list[str]) -> int:
             state = "loaded" if pkg.get("loaded") else "skipped"
             print(
                 f"- {pkg['id']} v{pkg.get('version') or '?'} [{pkg['scope']}] "
-                f"trusted={pkg.get('trusted')} {state}"
+                f"trusted={pkg.get('trusted')}"
+                + (f"({pkg['trust_source']})" if pkg.get("trust_source") else "")
+                + f" {state}"
                 + (f" error={pkg['error']}" if pkg.get("error") else "")
             )
+    skipped = [
+        pkg for pkg in kernel.runtime.packages if not pkg.get("loaded") and not pkg.get("error")
+    ]
+    if skipped:
+        print("\nskipped packages（未信任，未加载）:")
+        for pkg in skipped:
+            print(f"- {pkg['id']} [{pkg['scope']}] -> 运行 `markbot trust {pkg['id']}` 启用")
     if kernel.runtime.conflicts:
         print("\nconflicts:")
         for conflict in kernel.runtime.conflicts:
@@ -697,7 +740,11 @@ def cmd_optimize(argv: list[str]) -> int:
         min_eval_cases=cfg.optimizer.min_eval_cases,
         approve_skills="--approve-skills" in argv,
         judge=_make_judge(provider) if cfg.optimizer.llm_judge else None,
+        extra_suites=_gate_suites(cfg, provider, argv),
+        gate_tolerance=float(getattr(cfg.optimizer, "gate_tolerance", 0.0) or 0.0),
     )
+    if settings.extra_suites:
+        print("晋升门禁评测集：" + "、".join(settings.extra_suites), file=sys.stderr)
     report = asyncio.run(
         optimize(
             home=cfg.home,
@@ -715,9 +762,35 @@ def cmd_optimize(argv: list[str]) -> int:
         f"base={report.base_score} candidate={report.candidate_score} "
         f"selected={report.selected} promoted={report.promoted}"
     )
+    for name, score in report.suite_scores.items():
+        print(f"  {name}: {score}")
     for reason in report.reasons:
         print(f"- {reason}")
     return 0 if (report.promoted or dry_run) else 1
+
+
+def _gate_suites(cfg: Config, provider, argv: list[str]) -> dict:
+    """``[optimizer] gate_suites``（或 ``--gate-suites coding,browser``）-> 门禁评测集（ADR 0016）。"""
+    from markbot.cli.eval_cmd import SUITES, suite_runner
+
+    names = list(getattr(cfg.optimizer, "gate_suites", []) or [])
+    if "--gate-suites" in argv:
+        index = argv.index("--gate-suites")
+        raw = argv[index + 1] if index + 1 < len(argv) else ""
+        names = [part.strip() for part in raw.split(",") if part.strip() and part.strip() != "none"]
+    suites: dict = {}
+    for name in dict.fromkeys(names):
+        if name not in SUITES:
+            print(f"warning: 未知门禁评测集 {name}，已忽略（可选 {', '.join(SUITES)}）", file=sys.stderr)
+            continue
+        directory = Path(cfg.project_root) / "evals" / name
+        if not directory.is_dir():
+            print(f"warning: 门禁评测集 {name} 不存在 {directory}，已忽略", file=sys.stderr)
+            continue
+        suites[name] = suite_runner(
+            name, directory, provider=provider, max_cases=int(getattr(cfg.optimizer, "gate_max_cases", 5) or 0)
+        )
+    return suites
 
 
 def cmd_rollback(argv: list[str]) -> int:
@@ -854,6 +927,67 @@ def cmd_memory(argv: list[str]) -> int:
     return 2
 
 
+def cmd_stats(argv: list[str]) -> int:
+    """按天汇总 logs/events/*.jsonl：回合、失败、工具失败率、token、定时任务（ADR 0011）。"""
+    from markbot.kernel.metrics import render_summary, summarize
+
+    days = 7
+    if "--days" in argv:
+        try:
+            days = max(1, int(argv[argv.index("--days") + 1]))
+        except (IndexError, ValueError):
+            print("用法: markbot stats [--days N] [--json]", file=sys.stderr)
+            return 2
+    report = summarize(markbot_home(), days)
+    if "--json" in argv:
+        import json
+
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+    else:
+        print(render_summary(report))
+    return 0
+
+
+def cmd_project(argv: list[str]) -> int:
+    """项目登记：add <名称> <路径> | list | remove <名称>（ADR 0013）。"""
+    home = markbot_home()
+    action = argv[0] if argv else "list"
+    if action == "list":
+        projects = load_projects(home, (_load_raw_projects()))
+        if not projects:
+            print("还没有登记项目。用法: markbot project add <名称> <路径>")
+        for name, path in projects.items():
+            print(f"{name}\t{path}")
+        return 0
+    if action == "add" and len(argv) >= 3:
+        name, raw = argv[1], argv[2]
+        target = Path(raw).expanduser()
+        if not valid_project_name(name):
+            print("error: 项目名只能包含字母、数字、. _ -，且以字母或数字开头", file=sys.stderr)
+            return 2
+        if not target.is_dir():
+            print(f"error: 目录不存在: {target}", file=sys.stderr)
+            return 2
+        resolved = target.resolve()
+        if resolved == home.resolve() or home.resolve() in resolved.parents:
+            print("error: 不能把 MarkBot home 登记为项目", file=sys.stderr)
+            return 2
+        save_project(home, name, resolved)
+        print(f"已登记项目 {name} -> {resolved}（运行中的服务需要 markbot reload 或重启后生效）")
+        return 0
+    if action == "remove" and len(argv) >= 2:
+        save_project(home, argv[1], None)
+        print(f"已移除项目 {argv[1]}")
+        return 0
+    print("用法: markbot project add <名称> <路径> | list | remove <名称>", file=sys.stderr)
+    return 2
+
+
+def _load_raw_projects() -> dict:
+    cfg = _load()
+    return dict(cfg.raw.get("projects") or {}) if cfg is not None else {}
+
+
 def cmd_serve(argv: list[str]) -> int:
     port = 8787
     if "--port" in argv:
@@ -874,7 +1008,7 @@ def cmd_serve(argv: list[str]) -> int:
     log_file = gateway_log.install(markbot_home())
     logger = logging.getLogger("markbot.serve")
     logger.info("HTTP 入口启动 %s:%d，日志: %s", host, port, log_file)
-    kernel = _build(ui=NullUI(), gateway_logs=True)
+    kernel = _build(ui=NullUI(), gateway_logs=True, enforce_secrets=True)
     if kernel is None:
         return 2
     return run_server(
@@ -898,12 +1032,33 @@ COMMANDS = {
     "serve": cmd_serve,
     "gateway": gateway_command,
     "secrets": secrets_command,
+    "service": service_command,
+    "project": cmd_project,
+    "eval": eval_command,
+    "stats": cmd_stats,
     "sessions": sessions_command,
 }
 
 
+ALLOW_PLAINTEXT_FLAG = "--allow-plaintext-secrets"
+# chat / 一次性执行的 --project <名称>（ADR 0013）
+_PROJECT_FLAG: list[str | None] = [None]
+
+
 def main(argv: list[str] | None = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
+    if ALLOW_PLAINTEXT_FLAG in args:
+        # 全局开关：写进环境变量，gateway 拉起的 serve 子进程也能继承
+        args = [arg for arg in args if arg != ALLOW_PLAINTEXT_FLAG]
+        os.environ[ALLOW_PLAINTEXT_ENV] = "1"
+    _PROJECT_FLAG[0] = None
+    if "--project" in args and (args[0] in ("chat",) or args[0] not in COMMANDS):
+        index = args.index("--project")
+        if index + 1 >= len(args):
+            print("error: --project 需要项目名", file=sys.stderr)
+            return 2
+        _PROJECT_FLAG[0] = args[index + 1]
+        args = args[:index] + args[index + 2 :]
     if args and args[0] in {"-h", "--help", "help"}:
         print(HELP)
         return 0
@@ -913,11 +1068,11 @@ def main(argv: list[str] | None = None) -> int:
     if command in COMMANDS:
         return COMMANDS[command](args[1:])
     prompt = " ".join(args)
-    kernel = _build(ui=ConsoleUI(interactive=False))
+    kernel = _build(ui=ConsoleUI(interactive=False), enforce_secrets=True)
     if kernel is None:
         return 2
     try:
-        result = asyncio.run(kernel.run(prompt))
+        result = asyncio.run(kernel.run(prompt, project=_PROJECT_FLAG[0]))
     finally:
         asyncio.run(kernel.shutdown())
     if result.error:

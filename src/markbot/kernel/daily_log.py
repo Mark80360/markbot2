@@ -3,6 +3,8 @@
 目录：
 - ``~/.markbot/logs/runtime/YYYY-MM-DD.md``      运行事件、提示、警告、错误
 - ``~/.markbot/logs/interaction/YYYY-MM-DD.md``  用户输入、模型请求/回复、最终输出
+- ``~/.markbot/logs/events/YYYY-MM-DD.jsonl``    结构化事件（回合/工具/模型调用的耗时、结果、token），
+  不含对话正文；同时喂给内存指标（``/metrics``、``markbot stats``，ADR 0011）
 """
 
 from __future__ import annotations
@@ -15,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from markbot.kernel import gateway_log
+from markbot.kernel.metrics import Metrics, events_path
 from markbot.kernel.session import redact_secrets
 
 
@@ -38,6 +41,7 @@ class DailyLog:
         runtime: bool = True,
         interaction: bool = True,
         mirror_gateway: bool = False,
+        events: bool = True,
     ) -> None:
         self.home = Path(home)
         self.enabled = enabled
@@ -46,6 +50,30 @@ class DailyLog:
         self.mirror_gateway = mirror_gateway
         self._lock = threading.Lock()
         self._turns: dict[str, dict[str, Any]] = {}
+        self.events_enabled = events
+        # 内存指标始终可用（即使不落盘）；今日 token 从当天事件文件恢复
+        self.metrics = Metrics(self.home if enabled and events else None)
+
+    # -------------------------------------------------------------- events
+    def event(self, kind: str, **fields: Any) -> None:
+        """记录一条结构化事件。字段只放计数、耗时、类别、名称，不放对话正文。"""
+        record = {"ts": datetime.now().astimezone().isoformat(timespec="milliseconds"),
+                  "kind": kind, **fields}
+        try:
+            self.metrics.observe(record)
+        except Exception:  # noqa: BLE001 - 指标异常不影响主流程
+            pass
+        if not (self.enabled and self.events_enabled):
+            return
+        line = redact_secrets(json.dumps(record, ensure_ascii=False, default=str)) + "\n"
+        path = events_path(self.home)
+        with self._lock:
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                with path.open("a", encoding="utf-8") as fh:
+                    fh.write(line)
+            except OSError:
+                pass
 
     # ------------------------------------------------------------- runtime
     def runtime_log(self, level: str, message: str, **fields: Any) -> None:

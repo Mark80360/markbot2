@@ -1,0 +1,76 @@
+# 提交与 PR 门禁（ADR 0016）：Linux + Windows 双平台跑 ruff、全量测试与 shell 冒烟测试。
+# 严格 lint（scripts/lint_strict.sh）只报告不阻断。
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  PYTHONUTF8: "1"
+  PYTHONIOENCODING: utf-8
+  # 测试里的 CLI 调用不能碰到真实的 ~/.markbot
+  MARKBOT_HOME: ${{ github.workspace }}/.ci-markbot-home
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install
+        run: python -m pip install -e ".[dev,cron,mcp,office,channels,pdf,sysops]"
+
+      - name: Ruff
+        run: python -m ruff check src tests
+
+      - name: Shell smoke
+        # 单独一步，失败时一眼能看出是 shell/进程层的问题（bash / pwsh）
+        run: python -m pytest -q -p no:cacheprovider tests/test_shell_smoke.py
+
+      - name: Tests
+        run: python -m pytest -q -p no:cacheprovider
+
+      - name: Selftest
+        run: python -m markbot selftest
+
+  lint-strict:
+    name: lint-strict (report only)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - run: python -m pip install -e ".[dev]"
+      - name: Strict lint (ratchet)
+        run: |
+          mkdir -p .venv/bin
+          ln -sf "$(command -v python)" .venv/bin/python
+          ln -sf "$(command -v ruff)" .venv/bin/ruff
+          ln -sf "$(command -v pyright || true)" .venv/bin/pyright || true
+          bash scripts/lint_strict.sh

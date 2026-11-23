@@ -1,0 +1,4 @@
+prompt: |
+  config_parser.parse_line 在值里包含 "=" 时解析错误，并且不会忽略注释行。
+  按 tests/test_config_parser.py 修复，运行测试确认全部通过。不要修改测试。
+allowed: ["config_parser.py"]

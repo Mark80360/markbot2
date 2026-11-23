@@ -52,6 +52,11 @@ def redacted_message(message: Message, placeholder: str) -> Message:
     )
 
 
+def _images(data: dict[str, Any]) -> list[str]:
+    raw = data.get("images") or []
+    return [str(item) for item in raw if isinstance(item, str) and item] if isinstance(raw, list) else []
+
+
 def project_messages(events: Iterable[SessionEvent]) -> list[Message]:
     """把事件日志投影成消息列表（纯函数，可回放）。
 
@@ -62,7 +67,13 @@ def project_messages(events: Iterable[SessionEvent]) -> list[Message]:
     for event in sorted(events, key=lambda item: item.seq):
         data = event.data or {}
         if event.type == "user_message":
-            messages.append(Message(role="user", content=str(data.get("content") or "")))
+            messages.append(
+                Message(
+                    role="user",
+                    content=str(data.get("content") or ""),
+                    images=_images(data),
+                )
+            )
         elif event.type == "assistant_message":
             records = [
                 ToolCallRecord.model_validate(call) for call in (data.get("tool_calls") or [])
@@ -82,6 +93,7 @@ def project_messages(events: Iterable[SessionEvent]) -> list[Message]:
                     tool_call_id=data.get("tool_call_id"),
                     name=data.get("name"),
                     is_error=bool(data.get("is_error")),
+                    images=_images(data),
                 )
             )
         elif event.type == "compaction":

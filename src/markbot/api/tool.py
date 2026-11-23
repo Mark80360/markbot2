@@ -69,6 +69,16 @@ class Tool:
     input_schema: dict[str, Any] | None = None
     # 参数名 -> 角色（path / url / command / program）；见 ROLE_KEY
     arg_roles: Mapping[str, str] | None = None
+    # 并行工具调用时能否与其它调用同时执行（ADR 0012）。None = 按能力推断：
+    # 声明了 fs.write / exec 的工具不并发（避免并发写同一文件、命令互相干扰）
+    concurrency_safe: bool | None = None
+
+    def is_concurrency_safe(self) -> bool:
+        if self.concurrency_safe is not None:
+            return bool(self.concurrency_safe)
+        return not any(
+            str(cap).startswith(("fs.write", "exec")) for cap in (self.capabilities or ())
+        )
 
     def schema(self) -> dict[str, Any]:
         return {

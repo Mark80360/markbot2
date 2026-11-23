@@ -107,6 +107,7 @@ class Session:
         runtime: Any = None,
         events_dir: Path | None = None,
         append_request: bool = True,
+        request_images: list[str] | None = None,
     ) -> None:
         self.id = session_id or new_session_id()
         self.request = request
@@ -136,7 +137,7 @@ class Session:
         # 首次追加前检查文件末尾：上次崩溃可能留下没有换行的半行，直接追加会把新事件也写坏
         self._tail_checked = False
         if append_request:
-            self.append_user(request)
+            self.append_user(request, images=request_images)
 
     # ------------------------------------------------------------------ events
     @property
@@ -297,9 +298,13 @@ class Session:
         return session
 
     # ---------------------------------------------------------------- mutation
-    def append_user(self, text: str) -> None:
-        self.messages.append(Message(role="user", content=text))
-        self._append_event("user_message", {"content": text})
+    def append_user(self, text: str, images: list[str] | None = None) -> None:
+        paths = [str(item) for item in images or [] if str(item).strip()]
+        self.messages.append(Message(role="user", content=text, images=paths))
+        data: dict[str, Any] = {"content": text}
+        if paths:
+            data["images"] = paths
+        self._append_event("user_message", data)
 
     def append_assistant(self, text: str, tool_calls: list[Any] | None = None) -> None:
         records = [
@@ -318,6 +323,12 @@ class Session:
     def append_tool_results(self, calls: list[Any], results: list[Any]) -> None:
         for call, result in zip(calls, results):
             self.tool_call_count += 1
+            raw_images = (getattr(result, "details", None) or {}).get("images") or []
+            images = (
+                [str(item) for item in raw_images if isinstance(item, str) and item]
+                if isinstance(raw_images, list)
+                else []
+            )
             self.messages.append(
                 Message(
                     role="tool",
@@ -325,17 +336,18 @@ class Session:
                     tool_call_id=call.id,
                     name=call.name,
                     is_error=bool(result.is_error),
+                    images=images,
                 )
             )
-            self._append_event(
-                "tool_result",
-                {
-                    "content": result.content,
-                    "tool_call_id": call.id,
-                    "name": call.name,
-                    "is_error": bool(result.is_error),
-                },
-            )
+            data: dict[str, Any] = {
+                "content": result.content,
+                "tool_call_id": call.id,
+                "name": call.name,
+                "is_error": bool(result.is_error),
+            }
+            if images:
+                data["images"] = images
+            self._append_event("tool_result", data)
 
     def record_feedback(self, payload: dict[str, Any]) -> None:
         """用户反馈（点赞/纠正/评分），随会话归档写入 feedback.json。"""
@@ -543,6 +555,8 @@ def _events_from_messages(messages: list[Message]) -> list[SessionEvent]:
         seq += 1
         if message.role == "user":
             type_, data = "user_message", {"content": message.content}
+            if message.images:
+                data["images"] = list(message.images)
         elif message.role == "assistant":
             type_ = "assistant_message"
             data = {
@@ -557,6 +571,8 @@ def _events_from_messages(messages: list[Message]) -> list[SessionEvent]:
                 "name": message.name,
                 "is_error": message.is_error,
             }
+            if message.images:
+                data["images"] = list(message.images)
         events.append(
             SessionEvent(seq=seq, ts=now_iso(), type=type_, data=data)  # type: ignore[arg-type]
         )

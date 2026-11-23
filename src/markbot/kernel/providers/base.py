@@ -37,9 +37,20 @@ _MODERATION_MARKERS = (
 )
 
 
+_EXTRA_MARKERS: tuple[str, ...] = ()
+
+
+def register_moderation_markers(markers: list[str] | tuple[str, ...]) -> None:
+    """追加网关特有的审核拒绝特征（``[agent] moderation_markers``，ADR 0011）。"""
+    global _EXTRA_MARKERS
+    _EXTRA_MARKERS = tuple(
+        dict.fromkeys(str(item).strip().lower() for item in markers if str(item).strip())
+    )
+
+
 def is_moderation_rejection(body: str) -> bool:
     text = (body or "").lower()
-    return any(marker in text for marker in _MODERATION_MARKERS)
+    return any(marker in text for marker in (*_MODERATION_MARKERS, *_EXTRA_MARKERS))
 
 
 def describe_error(exc: BaseException | None) -> str:
@@ -123,6 +134,7 @@ __all__ = [
     "ToolCall",
     "describe_error",
     "is_moderation_rejection",
+    "register_moderation_markers",
     "make_tool_call",
     "parse_tool_arguments",
 ]

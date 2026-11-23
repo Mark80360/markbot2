@@ -24,6 +24,8 @@ class Message(_Model):
     tool_call_id: str | None = None
     name: str | None = None
     is_error: bool = False
+    # 附带的图片路径（ADR 0015）：只记路径，发给模型时 provider 才读取编码
+    images: list[str] = Field(default_factory=list)
 
 
 class SessionEvent(_Model):

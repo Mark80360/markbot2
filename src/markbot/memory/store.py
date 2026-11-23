@@ -95,6 +95,10 @@ def _skill_slug(topic: str) -> str:
     return slug[:64]
 
 
+def _percent(used: int, limit: int) -> str:
+    return f"{(used / limit * 100):.0f}%" if limit else "-"
+
+
 def _short(text: str, limit: int = 120) -> str:
     return text if len(text) <= limit else text[:limit] + "…"
 
@@ -123,7 +127,8 @@ def index_lines(entries: dict, *, today: str | None = None) -> list[str]:
     lines: list[str] = []
     for slug in sorted(entries):
         entry = entries.get(slug) or {}
-        if not isinstance(entry, dict):
+        if not isinstance(entry, dict) or entry.get("indexed") is False:
+            # 被容量整理移出索引的页面：正文仍在，memory_search 仍能检索到
             continue
         title = str(entry.get("title") or slug).strip()
         summary = str(entry.get("summary") or "").strip()
@@ -150,6 +155,16 @@ def _atomic_write(path: Path, text: str) -> None:
                 tmp.unlink()
             except OSError:
                 pass
+
+
+_PUNCT = re.compile(r"[\s，。；：、,.;:!?！？（）()\[\]【】\"'“”‘’·-]+")
+# 包含关系去重的最短长度：太短的片段（「中文」）容易误判
+DEDUP_MIN_CHARS = 8
+
+
+def _canon(text: str) -> str:
+    """比较用的规范形式：去掉空白与标点，统一大小写。"""
+    return _PUNCT.sub("", str(text or "")).lower()
 
 
 def _merge_lines(
@@ -196,7 +211,74 @@ def _merge_lines(
         return kept, removed, needle, "replaced"
     if any(_clean_line(line) == fact for line in lines):
         return lines, [], "", "same"
+    # 内容去重（ADR 0009）：规范化后相同、或新旧一方完整包含另一方时不重复追加。
+    # 新事实更完整 -> 替换旧行（旧行进归档）；新事实只是旧行的一部分 -> 视为无变化。
+    canon = _canon(fact)
+    if len(canon) >= DEDUP_MIN_CHARS:
+        for index, line in enumerate(lines):
+            if not _is_bullet(line):
+                continue
+            body = _clean_line(line)
+            other = _canon(body)
+            if len(other) < DEDUP_MIN_CHARS:
+                continue
+            if other == canon or canon in other:
+                return lines, [], "", "same"
+            if other in canon:
+                kept = [*lines[:index], entry, *lines[index + 1 :]]
+                return kept, [body], "", "replaced"
     return [*lines, entry], [], "", "appended"
+
+
+_LIFESPAN_ORDER = {"ephemeral": 0, "durable": 1, "permanent": 2}
+SHORT_SUMMARY_CHARS = 40
+
+
+def fit_index(entries: dict, *, keep: str = "", limit: int | None = None) -> list[str]:
+    """把索引的渲染结果压到 ``limit`` 以内，原地修改 ``entries``，返回所做整理的说明。
+
+    顺序：先缩短最旧条目的摘要（短期 -> 长期 -> 永久，同类按更新时间从旧到新），
+    仍超出再把最旧的非永久页面标记为 ``indexed: false``（页面正文不动）。
+    ``keep`` 是本次写入的页面，不参与整理。永久页面只缩短摘要，不移出索引。
+    """
+    limit = INDEX_LIMIT if limit is None else limit
+    notes: list[str] = []
+    if len(render_index(entries)) <= limit:
+        return notes
+
+    def order(slug: str) -> tuple[int, str, str]:
+        entry = entries.get(slug) or {}
+        return (
+            _LIFESPAN_ORDER.get(str(entry.get("lifespan") or "durable"), 1),
+            str(entry.get("updated_at") or ""),
+            slug,
+        )
+
+    candidates = sorted(
+        (
+            slug
+            for slug, entry in entries.items()
+            if slug != keep and isinstance(entry, dict) and entry.get("indexed") is not False
+        ),
+        key=order,
+    )
+    for slug in candidates:
+        entry = entries[slug]
+        summary = str(entry.get("summary") or "")
+        if len(summary) > SHORT_SUMMARY_CHARS + 1:
+            entry["summary"] = _short(summary, SHORT_SUMMARY_CHARS)
+            notes.append(f"缩短摘要 {slug}")
+        if len(render_index(entries)) <= limit:
+            return notes
+    for slug in candidates:
+        entry = entries[slug]
+        if str(entry.get("lifespan") or "durable") == "permanent":
+            continue
+        entry["indexed"] = False
+        notes.append(f"移出索引 {slug}（正文保留，可用 memory_search 检索）")
+        if len(render_index(entries)) <= limit:
+            return notes
+    return notes
 
 
 @dataclass
@@ -368,20 +450,24 @@ class MemoryStore:
                     "source_sessions": list(origin["sources"])[:5],
                     "chars": len(new_text),
                 }
-                index_text = self._dump_index(index)
                 # 容量按「注入上下文的渲染结果」计算，而不是 index.json 的字节数：
-                # JSON 带缩进与 title/日期/来源等元数据，旧口径下 4~5 页就把 2000 字符占满了
+                # JSON 带缩进与 title/日期/来源等元数据，旧口径下 4~5 页就把 2000 字符占满了。
+                # 超出时不再拒绝写入（ADR 0009）：先缩短最旧条目的摘要，仍超出再把最旧的
+                # 非永久页面移出索引（页面正文保留，memory_search 仍可检索）。
+                fitted = fit_index(index, keep=slug)
                 rendered = len(render_index(index))
                 if rendered > INDEX_LIMIT:
                     topics = "、".join(sorted(previous)) or "（无）"
                     return self._refuse(
                         "remember",
-                        f"记忆索引已满（注入 {rendered}/{INDEX_LIMIT} 字符，{len(previous)} 页）。"
+                        f"记忆索引已满（注入 {rendered}/{INDEX_LIMIT} 字符，{len(previous)} 页），"
+                        "且都是永久页面无法自动整理。"
                         f"不要原样重试：把内容并入已有主题（topic 取其一：{topics}），"
                         "或先用 memory_forget 删除过期页面",
                         rel,
                         session_id,
                     )
+                index_text = self._dump_index(index)
 
                 try:
                     _atomic_write(path, new_text)
@@ -404,8 +490,8 @@ class MemoryStore:
 
             self._archive(removed, fact)
             _logger.info(
-                "记忆写入 path=%s chars=%d verified=%s session=%s",
-                rel, len(new_text), verified, session_id or "-",
+                "记忆写入 path=%s chars=%d verified=%s session=%s fitted=%d",
+                rel, len(new_text), verified, session_id or "-", len(fitted),
             )
             return Receipt(
                 "remember",
@@ -416,6 +502,7 @@ class MemoryStore:
                 removed=[_short(item) for item in removed],
                 verified=verified,
                 chars=len(new_text),
+                message=("索引容量整理：" + "；".join(fitted)) if fitted else "",
             )
 
     def _commit(
@@ -673,18 +760,31 @@ class MemoryStore:
         resident = self._read_or_empty(self.resident_path)
         pages = sorted(self.wiki_dir.glob("*.md")) if self.wiki_dir.exists() else []
         index = self._read_index()
+        rendered = len(render_index(index))
+        hidden = sorted(
+            slug for slug, entry in index.items()
+            if isinstance(entry, dict) and entry.get("indexed") is False
+        )
         return {
             "resident": {
                 "path": RESIDENT_REL,
                 "chars": len(resident),
                 "limit": RESIDENT_LIMIT,
+                "usage": _percent(len(resident), RESIDENT_LIMIT),
             },
             "wiki": {
                 "path": WIKI_REL,
                 "pages": len(pages),
                 "topics": [page.stem for page in pages],
             },
-            "index": {"path": INDEX_REL, "entries": len(index), "limit": INDEX_LIMIT},
+            "index": {
+                "path": INDEX_REL,
+                "entries": len(index),
+                "limit": INDEX_LIMIT,
+                "rendered_chars": rendered,
+                "usage": _percent(rendered, INDEX_LIMIT),
+                "unindexed": hidden,
+            },
         }
 
     # ---------------------------------------------------------------- helpers
@@ -790,6 +890,7 @@ class MemoryStore:
 
 __all__ = [
     "INDEX_LIMIT",
+    "fit_index",
     "index_lines",
     "render_index",
     "INDEX_REL",

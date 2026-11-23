@@ -1,0 +1,11 @@
+<!doctype html><html lang="zh"><head><meta charset="utf-8"><title>水果检索</title></head><body>
+<h1>水果检索</h1><input id="q" placeholder="输入关键词（至少 2 个字母）"><ul id="r"><li>请输入关键词</li></ul>
+<script>
+const data=[["Apple","A-101"],["Banana","B-117"],["Kiwi","K-204"],["Mango","M-330"],["Cherry","C-042"]];
+document.getElementById("q").addEventListener("input",e=>{
+ const q=e.target.value.trim().toLowerCase(); const r=document.getElementById("r");
+ if(q.length<2){r.innerHTML="<li>请输入关键词</li>";return;}
+ const hit=data.filter(([n])=>n.toLowerCase().includes(q));
+ r.innerHTML = hit.length ? hit.map(([n,c])=>`<li>${n} — 编号 ${c}</li>`).join("") : "<li>没有结果</li>";
+});
+</script></body></html>

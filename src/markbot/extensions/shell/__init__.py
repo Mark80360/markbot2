@@ -9,9 +9,12 @@
 
 from __future__ import annotations
 
+import re
+
 from pydantic import BaseModel, Field
 
 from markbot.api import ExtensionAPI, Tool, ToolResult
+from markbot.extensions import _tracking as tracking
 
 # 命令自身的超时上限。外层工具超时必须比它长：让内层先超时、杀掉进程组并带回已有输出，
 # 而不是外层先取消（旧值外层 120s、内层最长 600s，长命令总是被外层打断）。
@@ -30,6 +33,14 @@ class RunIn(BaseModel):
         max_length=8,
         description="需要注入为环境变量的密钥名（只写名称，不写值）",
     )
+
+
+# 看起来是测试/检查/构建的命令：执行后记为一次验证（ADR 0012）
+_VERIFY = re.compile(
+    r"\b(pytest|py\.test|unittest|tox|nox|ruff|flake8|mypy|pyright|pylint|eslint|tsc|jest|vitest|"
+    r"go (test|vet|build)|cargo (test|check|build|clippy)|mvn (test|verify)|gradle\w* test|"
+    r"(npm|pnpm|yarn)( run)? (test|lint|build|typecheck)|make (test|check|lint))\b"
+)
 
 
 def _injectable(config) -> list[str]:
@@ -80,6 +91,10 @@ def setup(api: ExtensionAPI) -> None:
             result = await ctx.env.exec(args.command, timeout_s=timeout_s)
         content = result.combined()
         details = {"returncode": result.returncode}
+        if _VERIFY.search(args.command):
+            tracking.mark_verified(
+                getattr(ctx, "session", None), ok=result.ok, kind="command", summary=args.command[:200]
+            )
         if names:
             details["secrets"] = names
         if not result.ok:

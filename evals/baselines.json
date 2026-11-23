@@ -1,0 +1,7 @@
+{
+  "_comment": "夜间评测与 markbot eval --baseline 的最低通过率（ADR 0016）。先跑几晚看实际水平，再把基线调到略低于稳定值；只许往上调。",
+  "suites": {
+    "coding": {"min_ratio": 0.4},
+    "browser": {"min_ratio": 0.4}
+  }
+}

@@ -1,0 +1,12 @@
+<!doctype html><html lang="zh"><head><meta charset="utf-8"><title>登录</title></head><body>
+<h1>登录</h1>
+<label>用户名 <input id="u" placeholder="用户名"></label>
+<label>口令 <input id="k" type="password" placeholder="口令"></label>
+<button type="button" id="login">登录</button><p id="msg"></p>
+<script>
+document.getElementById("login").onclick=()=>{
+ if(document.getElementById("u").value==="demo" && document.getElementById("k").value==="open-sesame"){
+   sessionStorage.setItem("auth","1"); location.href="dashboard.html";
+ } else { document.getElementById("msg").textContent="用户名或口令错误"; }
+};
+</script></body></html>

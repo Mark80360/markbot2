@@ -1,0 +1,137 @@
+# 夜间评测（ADR 0016）：编码 + 浏览器评测集，用真实模型跑，结果写入趋势文件；
+# 通过率比上一次下降超过容忍度、或低于 evals/baselines.json 的基线时标红。
+#
+# 启用（仓库 Settings → Secrets and variables → Actions）：
+#   Variables:
+#     MARKBOT_EVAL_ENABLED   = true
+#     MARKBOT_EVAL_MODEL     = 例如 sensenova-6.8-flash
+#     MARKBOT_EVAL_BASE_URL  = 例如 http://192.168.71.90:3000/v1
+#     MARKBOT_EVAL_PROVIDER  = openai_compat（默认）或 anthropic
+#     MARKBOT_EVAL_RUNNER    = 运行机标签：模型网关在内网时填 self-hosted（默认 ubuntu-latest）
+#     MARKBOT_EVAL_TREND_FILE= 可选：自托管运行机上直接写 ~/.markbot/logs/optimizer.jsonl
+#     MARKBOT_EVAL_TOLERANCE = 可选：允许的通过率下降，默认 0.2
+#   Secrets:
+#     MARKBOT_EVAL_API_KEY
+name: eval
+
+on:
+  schedule:
+    - cron: "30 18 * * *"   # 每天 02:30（Asia/Shanghai）
+  workflow_dispatch:
+    inputs:
+      suites:
+        description: "评测集（逗号分隔）"
+        default: "coding,browser"
+      max_cases:
+        description: "每个评测集最多跑几个用例（0 = 全部）"
+        default: "0"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: eval
+  cancel-in-progress: false
+
+jobs:
+  eval:
+    if: ${{ vars.MARKBOT_EVAL_ENABLED == 'true' }}
+    runs-on: ${{ vars.MARKBOT_EVAL_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 120
+    env:
+      PYTHONUTF8: "1"
+      PYTHONIOENCODING: utf-8
+      MARKBOT_HOME: ${{ github.workspace }}/.eval-home
+      MARKBOT_EVAL_API_KEY: ${{ secrets.MARKBOT_EVAL_API_KEY }}
+      TREND_FILE: ${{ vars.MARKBOT_EVAL_TREND_FILE || '.eval-trend/optimizer.jsonl' }}
+      TOLERANCE: ${{ vars.MARKBOT_EVAL_TOLERANCE || '0.2' }}
+      SUITES: ${{ inputs.suites || 'coding,browser' }}
+      MAX_CASES: ${{ inputs.max_cases || '0' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install
+        shell: bash
+        run: |
+          python -m pip install -e ".[dev,browser,pdf]"
+          if [ "${{ runner.environment }}" = "github-hosted" ] && [ "${{ runner.os }}" = "Linux" ]; then
+            python -m playwright install --with-deps chromium
+          else
+            python -m playwright install chromium
+          fi
+
+      - name: Restore trend history
+        uses: actions/cache/restore@v4
+        with:
+          path: .eval-trend
+          key: eval-trend-${{ github.run_id }}
+          restore-keys: eval-trend-
+
+      - name: Write config
+        shell: bash
+        env:
+          EVAL_PROVIDER: ${{ vars.MARKBOT_EVAL_PROVIDER || 'openai_compat' }}
+          EVAL_MODEL: ${{ vars.MARKBOT_EVAL_MODEL }}
+          EVAL_BASE_URL: ${{ vars.MARKBOT_EVAL_BASE_URL }}
+        run: |
+          if [ -z "$EVAL_MODEL" ] || [ -z "$MARKBOT_EVAL_API_KEY" ]; then
+            echo "::error::需要设置变量 MARKBOT_EVAL_MODEL 与密钥 MARKBOT_EVAL_API_KEY"
+            exit 1
+          fi
+          mkdir -p "$MARKBOT_HOME" .eval-trend
+          python - <<'PY'
+          import json, os, pathlib
+          home = pathlib.Path(os.environ["MARKBOT_HOME"])
+          lines = [
+              "[agent]",
+              f"provider = {json.dumps(os.environ['EVAL_PROVIDER'])}",
+              f"model = {json.dumps(os.environ['EVAL_MODEL'])}",
+              f"base_url = {json.dumps(os.environ.get('EVAL_BASE_URL', ''))}",
+              'api_key = "env:MARKBOT_EVAL_API_KEY"',
+              "",
+              "[logging]",
+              "enabled = false",
+          ]
+          (home / "config.toml").write_text("\n".join(lines) + "\n", encoding="utf-8")
+          PY
+
+      - name: Run suites
+        shell: bash
+        run: |
+          status=0
+          IFS=',' read -ra names <<< "$SUITES"
+          for suite in "${names[@]}"; do
+            suite="$(echo "$suite" | xargs)"
+            [ -z "$suite" ] && continue
+            echo "::group::eval $suite"
+            python -m markbot eval --suite "$suite" --json --max-cases "$MAX_CASES" \
+              --record --trend-file "$TREND_FILE" \
+              --fail-on-regression --tolerance "$TOLERANCE" \
+              --baseline evals/baselines.json > "eval-$suite.json" || status=1
+            echo "::endgroup::"
+          done
+          python -m markbot eval --trend --trend-file "$TREND_FILE" --limit 14 >> "$GITHUB_STEP_SUMMARY" || true
+          exit $status
+
+      - name: Save trend history
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: .eval-trend
+          key: eval-trend-${{ github.run_id }}
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: eval-results
+          path: |
+            eval-*.json
+            .eval-trend/optimizer.jsonl
+          if-no-files-found: ignore

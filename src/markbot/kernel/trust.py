@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import json
+import os
+import shutil
+import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -55,6 +58,40 @@ class TrustStore:
             return True
         approved = entry.get("hash")
         return bool(approved) and approved == self.hash_of(path)
+
+    @staticmethod
+    def git_clean(path: Path, *, timeout_s: float = 5.0) -> bool:
+        """``path`` 下的文件都已被 git 跟踪、且没有未提交改动（含未跟踪的新文件）。
+
+        用于仓库内置包的开发模式信任；没有 git、不在仓库里、超时都返回 False。
+        """
+        git = shutil.which("git")
+        directory = Path(path)
+        if git is None or not directory.is_dir():
+            return False
+        flags = 0x08000000 if os.name == "nt" else 0  # CREATE_NO_WINDOW
+
+        def run(*args: str) -> subprocess.CompletedProcess[str] | None:
+            try:
+                return subprocess.run(
+                    [git, "-C", str(directory), *args],
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=timeout_s,
+                    creationflags=flags,
+                )
+            except (OSError, subprocess.SubprocessError):
+                return None
+
+        tracked = run("ls-files", "--", ".")
+        if tracked is None or tracked.returncode != 0 or not tracked.stdout.strip():
+            return False
+        status = run("status", "--porcelain", "--untracked-files=all", "--", ".")
+        if status is None or status.returncode != 0:
+            return False
+        return not status.stdout.strip()
 
     def approve(self, package_id: str, path: Path, *, scope: str = "user") -> str:
         digest = self.hash_of(path)

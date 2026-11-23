@@ -1,0 +1,4 @@
+prompt: |
+  calc.safe_divide 在除数为 0 时会抛异常，按 tests/test_calc.py 的要求修改：除数为 0 时返回 None。
+  修改后运行测试确认通过。不要修改测试。
+allowed: ["calc.py"]

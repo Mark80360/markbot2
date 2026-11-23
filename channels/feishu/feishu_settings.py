@@ -52,6 +52,9 @@ class Settings:
     transcribe_max_upload_mb: int = 25
     # 并行处理消息的线程数；同一 chat_id 的消息总是落到同一线程，严格按顺序处理
     workers: int = 4
+    # 异步任务（ADR 0010）：提交后按事件长轮询；等待超过 markbot_timeout_s 后不再占着
+    # 工作线程，任务在后台继续，完成后由服务端主动推送结果。服务端不支持时自动回退 /chat。
+    async_tasks: bool = True
 
     @property
     def require_mention(self) -> bool:
@@ -185,4 +188,5 @@ def load_settings(config_path: Path | None = None) -> Settings:
         transcribe_language=str(transcription.get("language") or "").strip(),
         transcribe_max_upload_mb=int(transcription.get("max_upload_mb") or 25),
         workers=max(1, min(16, int(section.get("workers") or 4))),
+        async_tasks=bool(section.get("async_tasks", True)),
     )

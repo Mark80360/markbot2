@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from markbot.api.media import image_block
 from markbot.kernel.providers.base import (
     DeltaCallback,
     ModelReply,
@@ -27,6 +28,7 @@ class AnthropicProvider:
         max_retries: int = 2,
         retry_backoff_s: float = 2.0,
         version: str = "2023-06-01",
+        prompt_cache: bool = False,
     ) -> None:
         self.api_key = api_key
         self.model = model
@@ -36,6 +38,9 @@ class AnthropicProvider:
         self.max_retries = max_retries
         self.retry_backoff_s = retry_backoff_s
         self.version = version
+        # 提示缓存（ADR 0013）：工具定义与系统提示加 cache_control 断点。第三方兼容网关可能
+        # 不认这个字段，所以默认关闭，由工厂在官方接口时打开
+        self.prompt_cache = prompt_cache
 
     async def complete(
         self, payload: dict[str, Any], on_delta: DeltaCallback | None = None
@@ -47,7 +52,11 @@ class AnthropicProvider:
             "messages": _messages(payload.get("messages", [])),
         }
         if payload.get("system"):
-            body["system"] = payload["system"]
+            body["system"] = (
+                [{"type": "text", "text": payload["system"], "cache_control": {"type": "ephemeral"}}]
+                if self.prompt_cache
+                else payload["system"]
+            )
         tools = payload.get("tools") or []
         if tools:
             body["tools"] = [
@@ -58,6 +67,9 @@ class AnthropicProvider:
                 }
                 for tool in tools
             ]
+            if self.prompt_cache:
+                # 工具定义在请求最前面且很少变化：缓存断点放在最后一个工具上
+                body["tools"][-1] = {**body["tools"][-1], "cache_control": {"type": "ephemeral"}}
         headers = {
             "x-api-key": self.api_key,
             "anthropic-version": self.version,
@@ -87,6 +99,21 @@ class AnthropicProvider:
         )
 
 
+def _blocks(text: str, paths: list[str]) -> list[dict[str, Any]]:
+    """文本 + 图片 -> Messages API 内容块；读取失败的图片改为文字说明。"""
+    blocks: list[dict[str, Any]] = []
+    notes: list[str] = []
+    for path in paths:
+        block = image_block(path)
+        if block is None:
+            notes.append(f"[图片 {path} 无法读取]")
+            continue
+        kind, data = block
+        blocks.append({"type": "image", "source": {"type": "base64", "media_type": kind, "data": data}})
+    text = "\n".join(part for part in (text, *notes) if part)
+    return [{"type": "text", "text": text or "（图片）"}, *blocks]
+
+
 def _messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     for msg in messages:
@@ -111,13 +138,19 @@ def _messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
             block = {
                 "type": "tool_result",
                 "tool_use_id": msg.get("tool_call_id"),
-                "content": msg.get("content", ""),
+                "content": (
+                    _blocks(str(msg.get("content") or ""), list(msg["images"]))
+                    if msg.get("images")
+                    else msg.get("content", "")
+                ),
                 "is_error": bool(msg.get("is_error")),
             }
             if out and out[-1]["role"] == "user" and isinstance(out[-1]["content"], list):
                 out[-1]["content"].append(block)
             else:
                 out.append({"role": "user", "content": [block]})
+        elif role == "user" and msg.get("images"):
+            out.append({"role": "user", "content": _blocks(str(msg.get("content") or ""), list(msg["images"]))})
         else:
             out.append({"role": role, "content": msg.get("content", "")})
     return out

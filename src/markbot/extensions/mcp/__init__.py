@@ -11,6 +11,9 @@
   连接中断时返回"结果未知"，避免重复副作用；
 - 日志中的服务端 URL 去掉凭据与查询串；
 - 连接失败只影响该 server，其它 server 与进程继续工作。
+- ``capabilities`` 给该 server 的全部工具声明能力（如 ``["net:*", "ui"]``），走统一的
+  权限策略：strict 档位下声明了 ``net:`` 的工具会被拒绝；``confirm_tools`` 是需要逐次
+  用户确认的工具名通配列表（如浏览器的点击、输入、执行脚本），无人值守时一律拒绝（ADR 0009）。
 
 MCP 连接绑定事件循环生命周期。markbot 的回合跑在各自的 ``asyncio.run`` 里，
 因此本扩展独占一个后台事件循环线程，跨回合复用连接，并在 shutdown 时关闭。
@@ -21,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import contextlib
+import fnmatch
 import hashlib
 import json
 import logging
@@ -71,6 +75,9 @@ class _ServerSpec:
     tool_timeout: float = 30.0
     connect_timeout: float = 20.0
     enabled_tools: list[str] = field(default_factory=lambda: ["*"])
+    # 该 server 全部工具的能力声明（走 PermissionPolicy）；需要逐次确认的工具名通配
+    capabilities: list[str] = field(default_factory=list)
+    confirm_tools: list[str] = field(default_factory=list)
 
     @property
     def transport(self) -> str:
@@ -95,6 +102,8 @@ class _ServerSpec:
             "tool_timeout": self.tool_timeout,
             "connect_timeout": self.connect_timeout,
             "enabled_tools": list(self.enabled_tools),
+            "capabilities": list(self.capabilities),
+            "confirm_tools": list(self.confirm_tools),
         }
 
 
@@ -320,6 +329,16 @@ def _parse_servers(config: Mapping[str, Any]) -> dict[str, _ServerSpec]:
         spec.enabled_tools = (
             [str(item) for item in enabled] if isinstance(enabled, list) else ["*"]
         )
+        caps = _pick(raw, "capabilities")
+        spec.capabilities = _valid_capabilities(name, caps)
+        confirm = _pick(raw, "confirm_tools", "confirmTools")
+        if isinstance(confirm, str):
+            confirm = [confirm]
+        spec.confirm_tools = (
+            [str(item).strip() for item in confirm if str(item).strip()]
+            if isinstance(confirm, list)
+            else []
+        )
 
         if not spec.transport:
             logger.warning("MCP server '%s': 缺少 command 或 url，已跳过", name)
@@ -337,6 +356,39 @@ def _parse_servers(config: Mapping[str, Any]) -> dict[str, _ServerSpec]:
             continue
         servers[spec.name] = spec
     return servers
+
+
+_CAP_KINDS = ("fs.read:", "fs.write:", "net:", "exec:", "secret:", "browser:", "desktop:")
+
+
+def _valid_capabilities(server: Any, raw: Any) -> list[str]:
+    """只保留语法正确的能力声明；扩展不依赖 kernel，这里只做形状检查，语义由策略判定。"""
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, list):
+        return []
+    out: list[str] = []
+    for item in raw:
+        text = str(item).strip()
+        if text == "ui" or (text.startswith(_CAP_KINDS) and text.split(":", 1)[1].strip()):
+            out.append(text)
+        elif text:
+            logger.warning("MCP server '%s': 忽略无法识别的能力声明 %r", server, text)
+    return out
+
+
+def _needs_confirm(spec: _ServerSpec, raw_name: str) -> bool:
+    return any(fnmatch.fnmatchcase(raw_name, pattern) for pattern in spec.confirm_tools)
+
+
+async def _confirm_call(ctx: Any, server: str, raw_name: str, raw_args: Mapping[str, Any]) -> bool:
+    confirm = getattr(ctx, "confirm", None)
+    if not callable(confirm):
+        return False
+    preview = json.dumps(dict(raw_args), ensure_ascii=False)
+    if len(preview) > 800:
+        preview = f"{preview[:600]}\n…（共 {len(preview)} 字符）…\n{preview[-200:]}"
+    return bool(await confirm(f"确认执行 MCP 工具 {server}/{raw_name}", preview))
 
 
 def _signature(servers: Mapping[str, _ServerSpec]) -> str:
@@ -788,6 +840,14 @@ def _make_tool(
 
     async def handler(ctx: Any, args: Any, _raw: str = raw_name) -> ToolResult:
         raw_args = dict(args) if isinstance(args, Mapping) else {}
+        if _needs_confirm(server.spec, _raw) and not await _confirm_call(
+            ctx, server.spec.name, _raw, raw_args
+        ):
+            return ToolResult.error(
+                f"permission denied: 用户未确认执行 MCP 工具 {server.spec.name}/{_raw}"
+                "（该工具在 confirm_tools 中；无人值守的任务无法确认）",
+                denied=True,
+            )
         result = await server.call(
             lambda session: session.call_tool(_raw, arguments=raw_args),
             kind="tool",
@@ -812,6 +872,7 @@ def _make_tool(
         params=_RawArgs,
         handler=handler,
         source="builtin",
+        capabilities=frozenset(server.spec.capabilities),
         timeout_s=_tool_timeout_budget(timeout),
         input_schema=_normalize_schema_for_provider(
             getattr(tool_def, "inputSchema", None) or {"type": "object", "properties": {}}

@@ -36,13 +36,17 @@ from typing import Any
 class TurnContext:
     ui: Any = None
     grants: frozenset[str] = field(default_factory=frozenset)
+    # 本回合的工作区根目录（绑定了项目时；ADR 0013）。None = Kernel 默认工作区
+    workspace: Any = None
 
     @classmethod
-    def create(cls, *, ui: Any = None, grants: Iterable[str] = ()) -> "TurnContext":
+    def create(
+        cls, *, ui: Any = None, grants: Iterable[str] = (), workspace: Any = None
+    ) -> "TurnContext":
         names = frozenset(
             str(item).strip().lower() for item in (grants or ()) if str(item).strip()
         )
-        return cls(ui=ui, grants=names)
+        return cls(ui=ui, grants=names, workspace=workspace)
 
 
 _CURRENT: contextvars.ContextVar[TurnContext | None] = contextvars.ContextVar(
@@ -57,6 +61,11 @@ def current_turn() -> TurnContext | None:
 def turn_grants() -> frozenset[str]:
     turn = _CURRENT.get()
     return turn.grants if turn is not None else frozenset()
+
+
+def turn_workspace() -> Any:
+    turn = _CURRENT.get()
+    return turn.workspace if turn is not None else None
 
 
 def turn_ui(default: Any = None) -> Any:
@@ -200,4 +209,5 @@ __all__ = [
     "session_scope",
     "turn_grants",
     "turn_ui",
+    "turn_workspace",
 ]

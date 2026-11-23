@@ -1,0 +1,12 @@
+<!doctype html><html lang="zh"><head><meta charset="utf-8"><title>激活码</title></head><body>
+<h1>生成激活码</h1>
+<label>姓名 <input id="name" placeholder="姓名"></label>
+<label>套餐 <select id="plan"><option value="basic">基础版</option><option value="pro">专业版</option></select></label>
+<button type="button" id="go">生成</button>
+<p id="out"></p>
+<script>
+document.getElementById("go").onclick=()=>{
+ const n=document.getElementById("name").value.trim(), p=document.getElementById("plan").value;
+ document.getElementById("out").textContent = (n==="李雷" && p==="pro") ? "激活码：MB-7319" : "信息不正确，请检查姓名与套餐";
+};
+</script></body></html>

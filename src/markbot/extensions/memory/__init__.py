@@ -184,8 +184,9 @@ def setup(api: ExtensionAPI) -> None:
             verified=receipt.verified,
         )
         removed = f"，替换 {len(receipt.removed)} 条旧内容" if receipt.removed else ""
+        fitted = f"\n{receipt.message}" if receipt.message else ""
         return ToolResult(
-            content=f"已写入 {receipt.path}（{receipt.chars} 字符，校验通过{removed}）",
+            content=f"已写入 {receipt.path}（{receipt.chars} 字符，校验通过{removed}）{fitted}",
             details=payload,
         )
 
@@ -278,8 +279,16 @@ def setup(api: ExtensionAPI) -> None:
             f"（{info['resident']['chars']}/{info['resident']['limit']} 字符）",
             f"wiki: {info['wiki']['path']}（{info['wiki']['pages']} 页："
             f"{'、'.join(info['wiki']['topics']) or '无'}）",
-            f"索引: {info['index']['path']}（{info['index']['entries']} 条）",
+            f"常驻记忆占用: {info['resident'].get('usage', '-')}",
+            f"索引: {info['index']['path']}（{info['index']['entries']} 条，注入 "
+            f"{info['index'].get('rendered_chars', 0)}/{info['index']['limit']} 字符，"
+            f"占用 {info['index'].get('usage', '-')}）",
         ]
+        hidden = info["index"].get("unindexed") or []
+        if hidden:
+            lines.append(
+                f"已移出索引（正文保留，可检索）: {'、'.join(hidden)}"
+            )
         return ToolResult(content="\n".join(lines), details=info)
 
     api.register_tool(

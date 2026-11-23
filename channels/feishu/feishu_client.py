@@ -182,8 +182,8 @@ class FeishuClient:
         media: list[str] | None = None,
         reply_to: str | None = None,
         reply_in_thread: bool = False,
-    ) -> None:
-        """先发媒体，再按内容复杂度选择 text / post / 卡片发送。"""
+    ) -> bool:
+        """先发媒体，再按内容复杂度选择 text / post / 卡片发送；全部文本发送成功返回 True。"""
         if media:
             try:
                 self.send_media(
@@ -196,7 +196,8 @@ class FeishuClient:
             reply_to = None
         text = (text or "").strip()
         if not text:
-            return
+            return True
+        ok = True
         fmt = _detect_msg_format(text)
         chunks = (
             _split_text(text) if fmt == "interactive" and len(text) > CARD_TEXT_LIMIT else [text]
@@ -210,13 +211,13 @@ class FeishuClient:
                         ensure_ascii=False,
                     )
                     target = reply_to if first else None
-                    self._deliver(
+                    ok = self._deliver(
                         chat_id,
                         "interactive",
                         card,
                         target,
                         reply_in_thread if target else False,
-                    )
+                    ) and ok
                     first = False
                 continue
             for part in _split_text(chunk):
@@ -227,14 +228,15 @@ class FeishuClient:
                     content = json.dumps({"text": part}, ensure_ascii=False)
                     msg_type = "text"
                 target = reply_to if first else None
-                self._deliver(
+                ok = self._deliver(
                     chat_id,
                     msg_type,
                     content,
                     target,
                     reply_in_thread if target else False,
-                )
+                ) and ok
                 first = False
+        return ok
 
     def _deliver(
         self,
@@ -243,7 +245,7 @@ class FeishuClient:
         content: str,
         reply_to: str | None,
         reply_in_thread: bool,
-    ) -> None:
+    ) -> bool:
         try:
             if reply_to:
                 message_id = self.reply_message(
@@ -261,10 +263,11 @@ class FeishuClient:
                     f"飞书消息已发送 chat={chat_id} type={msg_type} "
                     f"message_id={message_id or '-'} 长度={len(content)}"
                 )
+            return True
         except RuntimeError as exc:
             if msg_type != "interactive":
                 log(f"发送失败 chat={chat_id} type={msg_type}: {exc}")
-                return
+                return False
             log(f"卡片发送失败，回退纯文本 chat={chat_id}: {exc}")
             for chunk in _split_text(_card_to_text(content)):
                 try:
@@ -285,7 +288,8 @@ class FeishuClient:
                         )
                 except RuntimeError as inner:
                     log(f"回退文本也失败 chat={chat_id}: {inner}")
-                    return
+                    return False
+            return True
 
     # ---------------------------------------------------------------- 表情
     def add_reaction(self, message_id: str, emoji_type: str) -> str | None:

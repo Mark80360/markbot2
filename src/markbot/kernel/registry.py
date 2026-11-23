@@ -54,6 +54,8 @@ class PackageInfo:
     trusted: bool = False
     loaded: bool = False
     error: str = ""
+    # 信任来源：trust.json（hash 已批准）| git（仓库内置包、已提交且无未提交改动）
+    trust_source: str = ""
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -65,6 +67,7 @@ class PackageInfo:
             "trusted": self.trusted,
             "loaded": self.loaded,
             "error": self.error,
+            "trust_source": self.trust_source,
         }
 
 
@@ -413,9 +416,25 @@ class RuntimeAssembler:
             info.error = str(exc)
             self.warnings.append(f"包哈希失败，已跳过: {manifest.name} -> {exc}")
             return None
+        if info.trusted:
+            info.trust_source = "trust.json"
+        elif (
+            scope == "repo"
+            and getattr(self.config.packages, "trust_repo_from_git", False)
+            and self.trust.git_clean(directory)
+        ):
+            # 开发模式：仓库内置包已被 git 跟踪且没有未提交改动 -> 信任（ADR 0009）。
+            # 未提交的改动仍需显式 `markbot trust`，避免工作区里的临时修改被直接加载。
+            info.trusted = True
+            info.trust_source = "git"
         if not info.trusted:
+            hint = (
+                "；或提交改动后由 git 状态自动信任"
+                if scope == "repo" and getattr(self.config.packages, "trust_repo_from_git", False)
+                else ""
+            )
             self.warnings.append(
-                f"包未信任，已跳过: {manifest.name}（运行 markbot trust {manifest.name}）"
+                f"包未信任，已跳过: {manifest.name}（运行 markbot trust {manifest.name}{hint}）"
             )
             return None
 

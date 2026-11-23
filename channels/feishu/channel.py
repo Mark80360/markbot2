@@ -90,6 +90,31 @@ from feishu_gateway import (
 )
 
 
+# 订阅了但不需要处理的事件：不注册的话 SDK 每条都会打一行 ERROR「processor not found」。
+# 机器人自己加/删表情（处理中的 react_emoji）也会触发 reaction 事件（ADR 0009）。
+IGNORED_EVENTS = (
+    "register_p2_im_message_reaction_created_v1",
+    "register_p2_im_message_reaction_deleted_v1",
+    "register_p2_im_message_message_read_v1",
+)
+
+
+def _ignore_event(_data) -> None:
+    return None
+
+
+def register_ignored_events(builder):
+    """给 lark 事件分发器注册空处理器；旧版 SDK 没有对应方法时跳过。"""
+    for name in IGNORED_EVENTS:
+        register = getattr(builder, name, None)
+        if callable(register):
+            try:
+                builder = register(_ignore_event)
+            except Exception:  # noqa: BLE001 - 注册失败不影响主流程
+                continue
+    return builder
+
+
 def _json_response(handler: BaseHTTPRequestHandler, status: int, payload: dict) -> None:
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     handler.send_response(status)
@@ -190,8 +215,8 @@ def make_handler(gateway: Gateway, settings: Settings):
                 _json_response(self, 403, {"error": "invalid token"})
                 return
 
-            if gateway.intercept_confirmation(data):
-                log("[http] 确认回复已处理")
+            if gateway.intercept_confirmation(data) or gateway.intercept_control(data):
+                log("[http] 确认/控制命令已处理")
                 _json_response(self, 200, {"code": 0})
                 return
 
@@ -219,15 +244,16 @@ def run_long_connection(settings: Settings, gateway: Gateway) -> None:
             return
         data = json.loads(raw)
         # 确认回复要在 SDK 线程里直接处理：工作线程此时正阻塞等待本次回合
-        if gateway.intercept_confirmation(data):
+        # /stop、/status 同理：工作线程正在等任务，不能排在它后面
+        if gateway.intercept_confirmation(data) or gateway.intercept_control(data):
             return
         gateway.enqueue(data)
 
-    dispatcher = (
-        lark.EventDispatcherHandler.builder("", "")
-        .register_p2_im_message_receive_v1(on_message)
-        .build()
+    builder = lark.EventDispatcherHandler.builder("", "").register_p2_im_message_receive_v1(
+        on_message
     )
+    builder = register_ignored_events(builder)
+    dispatcher = builder.build()
     client = lark.ws.Client(
         settings.app_id,
         settings.app_secret,
@@ -311,6 +337,13 @@ def main(argv: list[str] | None = None) -> int:
         f"群聊策略={settings.group_policy} 话题隔离={settings.topic_isolation}"
     )
     log(f"消息处理线程已启动 workers={len(gateway.queues)}（同一聊天串行）")
+    # 收件箱/发件箱（ADR 0011）：清理 7 天前的记录，恢复上次没处理完的消息，启动发件箱重试
+    try:
+        store.prune_seen(7)
+    except Exception as exc:  # noqa: BLE001 - 清理失败不影响启动
+        log(f"清理过期记录失败: {exc}")
+    threading.Thread(target=gateway.outbox_worker, daemon=True, name="feishu-outbox").start()
+    gateway.recover_inbox()
 
     # 长连接模式下只需要一个本机回环端口来接收「确认请求」，不对外暴露
     bind_host = "127.0.0.1" if settings.mode == "longconn" else settings.host

@@ -1,0 +1,4 @@
+prompt: |
+  打开 {base_url}/search.html ，在搜索框里输入 kiwi 进行搜索，告诉我搜索结果中这个条目的编号。
+expect: ["K-204"]
+max_steps: 15
