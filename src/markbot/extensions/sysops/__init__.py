@@ -381,7 +381,7 @@ def setup(api: ExtensionAPI) -> None:
     specs: list[tuple[str, str, Any, Any, frozenset[str], float]] = [
         ("system_info", "查看本机状态：系统、CPU、内存、磁盘、运行时长", InfoIn, system_info, frozenset(), 30.0),
         ("list_processes", "列出占用 CPU / 内存最多的进程，可按名称过滤", ProcIn, list_processes, frozenset(), 30.0),
-        ("disk_usage", "查看分区剩余空间与目录下占用最大的项目", DiskIn, disk_usage, frozenset({"fs.read:*"}), 30.0),
+        ("disk_usage", "查看分区剩余空间与目录下占用最大的项目", DiskIn, disk_usage, frozenset({"fs.read:./**"}), 30.0),
         ("check_port", "检查主机端口能否连接（排查服务是否在线）", PortIn, check_port, frozenset({"net:*"}), 40.0),
         ("service_status", "查看 systemd 服务 / Windows 服务或计划任务的状态与最近日志", ServiceIn, service_status, frozenset(), 30.0),
         ("kill_process", "结束进程（按执行命令的权限规则确认）", KillIn, kill_process, frozenset({"exec:*"}), 30.0),

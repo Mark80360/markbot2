@@ -95,13 +95,14 @@ def _kill(proc: _Proc) -> None:
 def kill_all(session_id: str | None = None) -> int:
     with _LOCK:
         targets = [p for p in _PROCS.values() if session_id is None or p.session_id == session_id]
+    alive = sum(1 for proc in targets if proc.running())
     for proc in targets:
         _kill(proc)
     with _LOCK:
         for proc in targets:
             if not proc.running():
                 _PROCS.pop(proc.handle, None)
-    return len(targets)
+    return alive
 
 
 atexit.register(kill_all)
@@ -180,7 +181,16 @@ def _read(proc: _Proc, offset: int | None, wait_s: float, max_chars: int) -> Too
     )
 
 
+def _stop_on_cancel(config: Any) -> bool:
+    tools = (config or {}).get("tools") if isinstance(config, dict) else None
+    section = (tools or {}).get("process") if isinstance(tools, dict) else None
+    value = section.get("stop_on_cancel", True) if isinstance(section, dict) else True
+    return str(value).strip().lower() not in {"false", "0", "no", "off"}
+
+
 def setup(api: ExtensionAPI) -> None:
+    stop_on_cancel = _stop_on_cancel(getattr(api, "config", None))
+
     async def process_start(ctx, args: StartIn) -> ToolResult:
         spawn = getattr(ctx.env, "spawn", None)
         if not callable(spawn):
@@ -257,8 +267,21 @@ def setup(api: ExtensionAPI) -> None:
     async def _on_shutdown(*_args: Any, **_kwargs: Any) -> None:
         kill_all()
 
+    async def _on_turn_end(*_args: Any, **kwargs: Any) -> None:
+        # /stop 取消回合时一并结束本会话启动的后台进程（[tools.process] stop_on_cancel，默认开）。
+        # 否则用户发了 /stop，浏览器、http.server 之类的进程还在跑（2026-11-23 日志）
+        result = kwargs.get("result")
+        session = kwargs.get("session")
+        if not stop_on_cancel or session is None or getattr(result, "stopped_reason", "") != "cancelled":
+            return
+        count = kill_all(str(getattr(session, "id", "") or ""))
+        if count and result is not None:
+            note = f"已结束本会话的 {count} 个后台进程。"
+            result.text = f"{getattr(result, 'text', '') or ''}\n\n{note}".strip()
+
     api.on(EventName.SESSION_END, _on_session_end)
     api.on(EventName.SHUTDOWN, _on_shutdown)
+    api.on(EventName.TURN_END, _on_turn_end)
 
     common = {"concurrency_safe": False}
     api.register_tool(

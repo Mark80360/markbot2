@@ -374,7 +374,8 @@ class PermissionPolicy:
                 denials = [self._path_denial(cap, raw_path) for cap in fs_caps]
                 if all(reason is not None for reason in denials):
                     protected = next((r for r in denials if r and r.startswith("受保护")), None)
-                    return Decision(False, protected or f"越权文件访问: {raw_path}")
+                    detailed = next((r for r in denials if r), None)
+                    return Decision(False, protected or detailed or f"越权文件访问: {raw_path}")
             if any(c.kind == FS_WRITE for c in fs_caps):
                 if self.profile == "strict":
                     return Decision(False, "strict 模式禁止写文件")
@@ -463,6 +464,13 @@ class PermissionPolicy:
             return None
         if _is_absolute_pattern(pattern) and glob_match(pattern, resolved.as_posix()):
             return None
+        if not inside and pattern == "**":
+            # 工作区级能力访问工作区外：说清楚能去哪里，模型才不会反复试 /tmp 之类的路径
+            allowed = [str(self.root), *(str(path) for path in self.guard.writable)]
+            return (
+                f"越权文件访问: {raw_path}（不在工作区内；可访问 {'、'.join(allowed)} 与本会话临时目录，"
+                "工作区外的文件请先复制到这些目录）"
+            )
         return f"越权文件访问: {raw_path}"
 
 

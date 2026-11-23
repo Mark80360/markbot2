@@ -116,6 +116,24 @@ def scratch_dir(env: Any, session: Any) -> Path | None:
     return Path(home) / "sessions" / str(session_id) / "scratch"
 
 
+# 对话渠道能力说明：模型不知道自己在哪个渠道时，会臆测「不能发图片」（2026-11-23 日志）
+CHANNEL_NOTES = {
+    "feishu": (
+        "飞书。你的回复会发到飞书聊天；回复里写 ![说明](本地绝对路径) 或 [文件名](本地绝对路径)，"
+        "渠道会把该图片/文件作为飞书消息一并发给用户（截图、二维码、图表、报告都可以直接发）。"
+        "后台任务完成后的结果同样会带上这些图片/文件"
+    ),
+}
+
+
+def channel_line(session: Any) -> str:
+    metadata = getattr(session, "metadata", None) or {}
+    channel = str(metadata.get("channel") or "").strip().lower() if isinstance(metadata, dict) else ""
+    if not channel:
+        return ""
+    return f"对话渠道: {CHANNEL_NOTES.get(channel, channel)}"
+
+
 def environment_block(env: Any, session: Any = None) -> str:
     """运行环境说明（时间、时区、系统、shell、工作目录、git 分支、可用工具），每轮重新生成。
 
@@ -145,6 +163,9 @@ def environment_block(env: Any, session: Any = None) -> str:
     writable = getattr(getattr(env, "guard", None), "writable", ()) or ()
     if writable:
         lines.append(f"共享工作目录（可读写，跨会话保留）: {writable[0]}")
+    channel = channel_line(session)
+    if channel:
+        lines.append(channel)
     lines.append("</env>")
     return "\n".join(lines)
 

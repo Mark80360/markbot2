@@ -57,7 +57,8 @@ def test_unchecked_capabilities_detects_unannotated_tools():
         name="t", description="", params=NoPathIn, handler=_ok,
         capabilities=frozenset({"fs.write:./**", "net:api.example.com", "exec:*"}),
     )
-    assert sorted(unchecked_capabilities(blind)) == ["fs.write:./**", "net:api.example.com"]
+    # 能力值会规范化（去掉开头的 ./）
+    assert sorted(unchecked_capabilities(blind)) == ["fs.write:**", "net:api.example.com"]
     annotated = Tool(
         name="t", description="", params=RenamedPathIn, handler=_ok,
         capabilities=frozenset({"fs.read:./**"}),

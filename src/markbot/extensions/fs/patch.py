@@ -174,7 +174,16 @@ def apply_hunks(text: str, patch: FilePatch) -> str:
                 + "。请重新读取文件，按当前内容生成补丁"
             )
         out.extend(lines[cursor:pos])
-        out.extend(hunk.new_block)
+        # 上下文行用文件里的原文：宽松匹配（忽略行尾空白）时，补丁里的上下文行可能丢了行尾空格
+        offset = 0
+        for tag, line in hunk.lines:
+            if tag == " ":
+                out.append(lines[pos + offset])
+                offset += 1
+            elif tag == "-":
+                offset += 1
+            else:
+                out.append(line)
         cursor = pos + len(hunk.old_block)
         delta += len(hunk.new_block) - len(hunk.old_block)
         if cursor >= len(lines):

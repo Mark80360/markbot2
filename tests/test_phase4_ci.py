@@ -276,7 +276,10 @@ def test_eval_legacy_exit_code_and_trend_view(eval_env, capsys):
 
 
 def _workflow(name: str) -> dict:
-    data = yaml.safe_load((REPO / ".github" / "workflows" / name).read_text(encoding="utf-8"))
+    path = REPO / ".github" / "workflows" / name
+    if not (REPO / ".github").is_dir():
+        pytest.skip("工作区里没有 .github/（只同步了 src/tests）；完整仓库里这条测试必须运行")
+    data = yaml.safe_load(path.read_text(encoding="utf-8"))
     # PyYAML 把裸 on 解析成 True
     data["on"] = data.pop(True, data.get("on"))
     return data

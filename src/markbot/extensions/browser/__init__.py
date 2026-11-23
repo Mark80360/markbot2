@@ -30,6 +30,7 @@ import asyncio
 import importlib.util
 import json
 import logging
+import os
 import re
 import threading
 import time
@@ -107,6 +108,8 @@ class BrowserSettings:
     proxy: str = ""
     viewport_width: int = 1280
     viewport_height: int = 900
+    # 有界面模式用哪个 X 显示（Linux 服务器上常见的是 Xvfb 虚拟屏 ":99"）；空 = 沿用进程的 DISPLAY
+    display: str = ""
 
 
 def _list(value: Any) -> list[str]:
@@ -121,7 +124,7 @@ def parse_settings(config: Any) -> BrowserSettings:
     raw = raw if isinstance(raw, dict) else {}
     web = (tools or {}).get("web") if isinstance(tools, dict) else None
     settings = BrowserSettings()
-    for key in ("enabled", "headless", "channel", "executable_path", "user_data_dir", "proxy"):
+    for key in ("enabled", "headless", "channel", "executable_path", "user_data_dir", "proxy", "display"):
         if key in raw:
             setattr(settings, key, raw[key])
     for key in ("idle_timeout_s", "navigation_timeout_s"):
@@ -303,6 +306,8 @@ class _Runtime:
             kwargs["executable_path"] = self.settings.executable_path
         if self.settings.proxy:
             kwargs["proxy"] = {"server": self.settings.proxy}
+        if not self.settings.headless and self.settings.display:
+            kwargs["env"] = {**os.environ, "DISPLAY": str(self.settings.display)}
         self.pw = await async_playwright().start()
         try:
             self.context = await self.pw.chromium.launch_persistent_context(str(profile), **kwargs)
@@ -922,14 +927,22 @@ def setup(api: ExtensionAPI) -> None:
         ("browser_handoff", "遇到验证码、扫码登录等需要人工处理时，请用户在浏览器窗口里完成", HandoffIn, browser_handoff),
         ("browser_close", "关闭本会话打开的标签页", EmptyIn, browser_close),
     ]
+    mode = "无头模式" if settings.headless else (
+        f"有界面模式（DISPLAY={settings.display}）" if settings.display else "有界面模式"
+    )
     for name, description, params, fn in tools:
+        if name == "browser_open":
+            description = (
+                f"{description}。当前为{mode}，由 [tools.browser] headless / display 配置决定；"
+                "无头模式被网站拦截时请用户修改配置并重启"
+            )
         api.register_tool(
             Tool(
                 name=name,
                 description=description,
                 params=params,
                 handler=_wrap(fn),
-                capabilities=caps | {"fs.read:*"} if name == "browser_upload" else caps,
+                capabilities=caps | {"fs.read:./**"} if name == "browser_upload" else caps,
                 timeout_s=op_timeout + 600 if name in {"browser_handoff", "browser_wait"} else op_timeout + 10,
                 concurrency_safe=False,
             )

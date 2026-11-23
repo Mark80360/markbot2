@@ -167,11 +167,46 @@ VERIFY_REMINDER = (
 )
 
 
-def _needs_verification(session: Any) -> bool:
+_NON_CODE = frozenset(
+    {".md", ".markdown", ".txt", ".rst", ".log", ".csv", ".json", ".yaml", ".yml", ".toml",
+     ".ini", ".cfg", ".html", ".css", ".svg", ".png", ".jpg", ".jpeg", ".gif", ".pdf"}
+)
+
+
+def _within(path: str, root: Path) -> bool:
+    try:
+        Path(path).resolve().relative_to(Path(root).resolve())
+        return True
+    except (ValueError, OSError):
+        return False
+
+
+def _needs_verification(session: Any, since: float | None = None, root: Path | None = None) -> bool:
+    """改了代码却没验证。``since`` / ``root`` 给出时只看本回合、工作区内的代码改动。
+
+    旧行为（会话级 code_changed_at）会让后续每个回合都被提醒一次，哪怕这个回合什么都没改；
+    改的若是工作区外的临时脚本（<home>/workspace、会话临时目录），也不该要求跑项目测试。
+    """
     changed = getattr(session, "code_changed_at", None)
     if not changed:
         return False
-    return (getattr(session, "verified_at", None) or 0) < changed
+    verified = getattr(session, "verified_at", None) or 0
+    if since is None and root is None:
+        return verified < changed
+    changes = getattr(session, "file_changes", None) or {}
+    if not changes:
+        return verified < changed and (since is None or changed >= since)
+    for path, entry in changes.items():
+        at = float(entry.get("at") or 0)
+        if since is not None and at < since:
+            continue
+        if Path(path).suffix.lower() in _NON_CODE:
+            continue
+        if root is not None and not _within(path, root):
+            continue
+        if verified < at:
+            return True
+    return False
 
 
 def _changed_files(session: Any, limit: int = 5) -> str:
@@ -245,6 +280,15 @@ class AgentLoop:
             else None
         )
 
+    def _scope_root(self) -> Path | None:
+        """本回合工作区（绑定项目时是项目目录）。"""
+        try:
+            policy = self._scope()[0] if self._scope is not None else self._policy
+        except Exception:  # noqa: BLE001
+            policy = self._policy
+        root = getattr(policy, "root", None)
+        return Path(root) if root is not None else None
+
     def _current_ui(self) -> UI:
         """本回合的 UI（TurnContext）优先；没有时用构造时注入的默认 UI。"""
         return turn_ui(self._ui)
@@ -265,6 +309,7 @@ class AgentLoop:
         reminded = False
         result = TurnResult(session_id=session.id)
         started = time.monotonic()
+        turn_started_at = time.time()
         # 本回合所有模型调用的累计 usage；_complete 每次调用都往里加
         session_usage = {"tokens_in": 0, "tokens_out": 0, "tokens_cached": 0}
         # 子代理在同一个任务里嵌套运行：结束后必须恢复外层回合的累计
@@ -318,7 +363,9 @@ class AgentLoop:
                     and self._cfg.verify_reminder
                     and not reminded
                     and steps < self._cfg.max_steps - 1
-                    and _needs_verification(session)
+                    and _needs_verification(
+                        session, since=turn_started_at, root=self._scope_root()
+                    )
                 ):
                     # 不结束回合：把提醒作为一条用户消息写回会话，让模型先验证（只提醒一次）
                     reminded = True

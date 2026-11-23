@@ -338,7 +338,7 @@ def test_browser_registration_follows_enabled_flag(monkeypatch):
     tools = _setup(browser, {"tools": {"browser": {"enabled": True}}})
     assert {"browser_open", "browser_snapshot", "browser_click", "browser_type", "browser_handoff"} <= set(tools)
     assert all("browser:*" in tool.capabilities for tool in tools.values())
-    assert "fs.read:*" in tools["browser_upload"].capabilities
+    assert "fs.read:./**" in tools["browser_upload"].capabilities
     monkeypatch.setattr(browser.importlib.util, "find_spec", lambda name: None)
     assert _setup(browser, {"tools": {"browser": {"enabled": "auto"}}}) == {}
 

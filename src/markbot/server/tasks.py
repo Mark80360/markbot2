@@ -232,18 +232,20 @@ class TaskManager:
             self._threads.pop(task_id, None)
             claimed = _now() - self._last_poll.get(task_id, 0.0) < UNCLAIMED_AFTER_S
             push = bool(record.notify) and (record.detached or not claimed)
-        self._persist(record)
-        self._emit(
-            task_id,
-            {
-                "type": "done",
-                "state": state,
-                "text": record.text,
-                "error": record.error,
-                "stopped_reason": stopped_reason,
-                "session_id": record.session_id,
-            },
-        )
+            # 顺序：先落盘终态，再追加 done 事件，且都在同一把锁里（Condition 默认是可重入锁）。
+            # 轮询方看到 done 时，状态文件一定已经是终态；也不会出现「终态已可见、done 还没追加」
+            self._persist(record)
+            self._emit(
+                task_id,
+                {
+                    "type": "done",
+                    "state": state,
+                    "text": record.text,
+                    "error": record.error,
+                    "stopped_reason": stopped_reason,
+                    "session_id": record.session_id,
+                },
+            )
         logger.info(
             "任务结束 task=%s state=%s reason=%s push=%s", task_id, state, stopped_reason, push
         )

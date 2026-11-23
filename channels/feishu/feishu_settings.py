@@ -55,6 +55,10 @@ class Settings:
     # 异步任务（ADR 0010）：提交后按事件长轮询；等待超过 markbot_timeout_s 后不再占着
     # 工作线程，任务在后台继续，完成后由服务端主动推送结果。服务端不支持时自动回退 /chat。
     async_tasks: bool = True
+    # 工作线程最多等一个任务多久就放手转后台（秒）；0 = 只看 markbot_timeout_s。
+    # 同一聊天的消息由同一个工作线程按顺序处理：等太久，期间发来的新消息全部排在后面
+    # （2026-11-23：等了 608 秒，两条消息排队 3 分钟）。
+    task_wait_s: float = 120.0
 
     @property
     def require_mention(self) -> bool:
@@ -189,4 +193,5 @@ def load_settings(config_path: Path | None = None) -> Settings:
         transcribe_max_upload_mb=int(transcription.get("max_upload_mb") or 25),
         workers=max(1, min(16, int(section.get("workers") or 4))),
         async_tasks=bool(section.get("async_tasks", True)),
+        task_wait_s=float(section.get("task_wait_s", 120) or 0),
     )

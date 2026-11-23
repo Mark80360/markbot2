@@ -293,6 +293,7 @@ DRAIN_TIMEOUT_S = 60.0
 ALERT_INTERVAL_S = 600.0
 _SESSION_ID = re.compile(r"^[A-Za-z0-9_.~-]{1,160}$")
 _PROJECT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
+_CHANNEL = re.compile(r"^[a-z][a-z0-9_-]{0,19}$")
 
 
 def parse_chat_request(data: Any) -> tuple[dict[str, Any] | None, str | None]:
@@ -320,7 +321,12 @@ def parse_chat_request(data: Any) -> tuple[dict[str, Any] | None, str | None]:
     project = str(data.get("project") or "").strip() or None
     if project and not _PROJECT.match(project):
         return None, "invalid project"
+    # 渠道名只用于告诉模型「回复发到哪、能不能发图片」，不影响权限
+    channel = str(data.get("channel") or "").strip().lower() or None
+    if channel and not _CHANNEL.match(channel):
+        channel = None
     return {
+        "channel": channel,
         "project": project,
         "prompt": prompt,
         "session_id": session_id,
@@ -345,9 +351,21 @@ def execute_chat(
     on_delta: Any = None,
     on_event: Any = None,
     project: str | None = None,
+    channel: str | None = None,
+    should_run: Any = None,
 ):
-    """执行一个聊天回合（/chat 与异步任务共用）。确认 UI 与授权只属于本回合。"""
+    """执行一个聊天回合（/chat 与异步任务共用）。确认 UI 与授权只属于本回合。
+
+    ``should_run``：拿到会话锁之后再问一次是否还要执行。排在同一会话后面的任务在等锁期间
+    被 /stop 取消时，不能拿到锁之后照常跑（2026-11-23：/stop 后排队的消息又跑了 112 秒）。
+    """
     with session_scope(run_lock, session_id):
+        if should_run is not None and not should_run():
+            from markbot.kernel.loop import TurnResult
+
+            return TurnResult(
+                stopped_reason="cancelled", error="任务在开始前被取消", session_id=session_id
+            )
         turn_ui = None
         hook_url, _ = _hook_url(confirm_hook)
         if hook_url:
@@ -360,11 +378,11 @@ def execute_chat(
         # 渠道把“主动发消息”的回调地址带进来，cron 工具据此决定结果投递到哪
         notify_url, _ = _hook_url(notify_hook)
         notify_chat = str(notify_hook.get("chat_id") or "")
-        metadata = (
-            {"notify": {"url": notify_url, "chat_id": notify_chat}}
-            if notify_url and notify_chat
-            else None
-        )
+        metadata: dict[str, Any] = {}
+        if notify_url and notify_chat:
+            metadata["notify"] = {"url": notify_url, "chat_id": notify_chat}
+        if channel:
+            metadata["channel"] = channel
         return asyncio.run(
             kernel.run(
                 prompt,
@@ -373,7 +391,7 @@ def execute_chat(
                 new_session=not session_id,
                 # 多个聊天并存：开新会话时不能结束其他聊天的会话
                 end_previous=False,
-                metadata=metadata,
+                metadata=metadata or None,
                 on_delta=on_delta,
                 on_event=on_event,
                 ui=turn_ui,
@@ -444,6 +462,8 @@ def run_server(
             on_delta=on_delta,
             on_event=on_event,
             project=args.get("project"),
+            channel=args.get("channel"),
+            should_run=lambda: not record.cancel_requested,
         )
 
     tasks = TaskManager(kernel.home, task_runner, token=auth_token, cancel=kernel.cancel)
@@ -723,6 +743,7 @@ def run_server(
                     "confirm_hook": request["confirm_hook"],
                     "notify_hook": request["notify_hook"],
                     "project": request["project"],
+                    "channel": request["channel"],
                 },
             )
             logger.info(
@@ -774,6 +795,7 @@ def run_server(
                 request["notify_hook"],
                 on_delta=on_delta,
                 project=request["project"],
+                channel=request["channel"],
             )
 
         def _stream_chat(self, request: dict[str, Any]) -> None:

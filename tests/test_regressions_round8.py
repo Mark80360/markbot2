@@ -105,7 +105,7 @@ def test_exec_argv_opens_protected_cwd_readonly(tmp_path, monkeypatch):
         captured["readable"] = extra_readable
         return argv
 
-    async def fake_run(argv, *, cwd, timeout_s, env):
+    async def fake_run(argv, *, cwd, timeout_s, env, **_kwargs):
         return SimpleNamespace(ok=True, returncode=0, stdout="", stderr="", timed_out=False)
 
     import markbot.kernel.execution as execution

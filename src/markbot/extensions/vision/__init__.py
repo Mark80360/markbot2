@@ -61,7 +61,7 @@ def setup(api: ExtensionAPI) -> None:
             ),
             params=ViewImageIn,
             handler=view_image,
-            capabilities=frozenset({"fs.read:*"}),
+            capabilities=frozenset({"fs.read:./**"}),
             timeout_s=120.0,
         )
     )

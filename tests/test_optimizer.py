@@ -186,11 +186,12 @@ def test_optimize_rejects_when_regression_drops(tmp_path):
             evals_dir=project / "evals" / "cases",
             provider=EchoProvider(),
             run_case=run_case,
+            settings=OptimizerSettings(min_eval_cases=1),
             emit=lambda *_: None,
         )
     )
     assert not report.promoted
-    assert any("低于基线" in reason for reason in report.reasons)
+    assert any("低于基线" in reason for reason in report.reasons), report.reasons
     assert read_tree(learned)["strategy/system_prompt.md"] == "base\n"
 
 
@@ -210,12 +211,13 @@ def test_optimize_dry_run_does_not_promote(tmp_path):
             evals_dir=project / "evals" / "cases",
             provider=EchoProvider(),
             run_case=run_case,
+            settings=OptimizerSettings(min_eval_cases=1),
             dry_run=True,
             emit=lambda *_: None,
         )
     )
     assert not report.promoted
-    assert any("dry-run" in reason for reason in report.reasons)
+    assert any("dry-run" in reason for reason in report.reasons), report.reasons
     assert read_tree(learned)["strategy/system_prompt.md"] == "base\n"
 
 

@@ -512,7 +512,11 @@ class Gateway:
 
     # ------------------------------------------------------------ 发件箱
     def _send(self, chat_id: str, text: str) -> tuple[bool, str]:
+        # 后台任务结果、定时任务结果里的 ![..](本地路径) 同样作为图片/文件发出
+        media = _extract_local_media(text)
         try:
+            if media:
+                return bool(self._client.send_answer(chat_id, text, media=media)), ""
             return bool(self._client.send_answer(chat_id, text)), ""
         except Exception as exc:  # noqa: BLE001 - 由发件箱重试
             return False, f"{type(exc).__name__}: {exc}"
@@ -985,6 +989,8 @@ class Gateway:
         # 定时任务等后台流程要主动发消息时，通过这个回调回到原聊天
         if chat_id:
             payload["notify_hook"] = {"url": self.notify_hook, "chat_id": chat_id}
+        # 告诉服务端回复发往飞书：模型据此知道可以在回复里嵌入本地图片/文件
+        payload["channel"] = "feishu"
         if getattr(self._settings, "async_tasks", True) and self._tasks_supported:
             try:
                 return self._run_task(payload, chat_key=chat_key, on_delta=on_delta)
@@ -1105,7 +1111,7 @@ class Gateway:
             raise RuntimeError(f"提交任务失败（HTTP {status}）: {_preview(json.dumps(task, ensure_ascii=False), 200)}")
         task_id = str(task["task_id"])
         session_id = str(task.get("session_id") or "")
-        inbox_key = getattr(self._local, "inbox_key", "")
+        inbox_key = getattr(getattr(self, "_local", None), "inbox_key", "")
         if inbox_key:
             # 渠道若在等待期间崩溃，重启后不再重复提交这条消息
             self._store.inbox_set_task(inbox_key, task_id)
@@ -1116,6 +1122,9 @@ class Gateway:
         after = 0
         failures = 0
         soft_limit = max(30.0, float(self._settings.markbot_timeout_s))
+        task_wait = float(getattr(self._settings, "task_wait_s", 0) or 0)
+        if task_wait > 0:
+            soft_limit = min(soft_limit, max(30.0, task_wait))
         while True:
             remaining = soft_limit - (time.monotonic() - started)
             if remaining <= 0:
