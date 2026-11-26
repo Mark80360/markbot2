@@ -354,7 +354,7 @@ def test_prompt_cache_auto_only_for_official_api(tmp_path, monkeypatch):
 
 def test_token_budget_calibrates_compaction(make_kernel, home, project):
     cfg = load_config(home=home, project_root=project)
-    cfg.agent.context_budget_tokens = 20_000
+    cfg.agent.max_tokens = 20_000
     provider = ScriptedProvider([ModelReply(text="ok", usage={"prompt_tokens": 1000})])
     kernel = make_kernel(provider=provider, config=cfg)
     before = kernel.loop._compactor.budget_chars

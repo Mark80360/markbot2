@@ -192,8 +192,10 @@ class FeishuClient:
             except RuntimeError as exc:
                 # 媒体失败不应拖累文本回复
                 log(f"发送媒体失败 chat={chat_id}: {exc}")
-            # 媒体已用掉引用位，后续文本单独发送，避免多条消息叠在一起
-            reply_to = None
+            # 话题内回复要保留回复位，让后续文本仍留在同一话题；引用模式只引用第一条，
+            # 避免多条消息叠在同一条原消息下
+            if not reply_in_thread:
+                reply_to = None
         text = (text or "").strip()
         if not text:
             return True
@@ -210,7 +212,7 @@ class FeishuClient:
                         {"config": {"wide_screen_mode": True}, "elements": elements},
                         ensure_ascii=False,
                     )
-                    target = reply_to if first else None
+                    target = reply_to if (first or reply_in_thread) else None
                     ok = self._deliver(
                         chat_id,
                         "interactive",
@@ -227,7 +229,7 @@ class FeishuClient:
                 else:
                     content = json.dumps({"text": part}, ensure_ascii=False)
                     msg_type = "text"
-                target = reply_to if first else None
+                target = reply_to if (first or reply_in_thread) else None
                 ok = self._deliver(
                     chat_id,
                     msg_type,
@@ -278,7 +280,8 @@ class FeishuClient:
                             json.dumps({"text": chunk}, ensure_ascii=False),
                             reply_in_thread=reply_in_thread,
                         )
-                        reply_to = None
+                        if not reply_in_thread:
+                            reply_to = None
                     else:
                         self.send_message(
                             "chat_id",
@@ -461,7 +464,7 @@ class FeishuClient:
                 content = {"file_key": key}
             if not key:
                 continue
-            target = reply_to if first else None
+            target = reply_to if (first or reply_in_thread) else None
             try:
                 self._deliver(
                     chat_id,

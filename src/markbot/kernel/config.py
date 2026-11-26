@@ -30,7 +30,9 @@ class AgentConfig:
     parallel_tools: bool = True
     # serve/gateway 中同时执行的回合上限；同一会话始终串行
     max_concurrent_turns: int = 4
-    context_budget_chars: int = 60_000
+    # 上下文压缩触发点：用量达到 max_tokens 的该比例时压缩（0.8 = 80%）。
+    # 初版字符数与 token 预算（context_budget_chars / context_budget_tokens）已移除。
+    context_budget_ratio: float = 0.8
     tool_result_max_chars: int = 16_000
     # 备用模型（ADR 0010）：[[agent.fallbacks]] provider/model/base_url/api_key("env:NAME")
     # 或 api_key_secret（[secrets] 里的名字）。主模型失败时按顺序切换。
@@ -46,9 +48,6 @@ class AgentConfig:
     moderation_markers: list[str] = field(default_factory=list)
     # 审核拒绝且无法定位触发内容时，自动换一个带摘要的新会话，避免该会话永久不可用
     moderation_new_session: bool = True
-    # 上下文预算（token）。>0 时按 provider 返回的 usage 校准字符/token 比例，换算压缩阈值，
-    # 优先于 context_budget_chars（ADR 0013）。建议设为模型上下文窗口的 60%~70%
-    context_budget_tokens: int = 0
     # Anthropic 提示缓存：auto = 官方接口（api.anthropic.com）时开启；true / false 强制
     prompt_cache: str = "auto"
     # 多模态（ADR 0015）：模型能否直接看图。auto = 按 provider / 模型名判断；true / false 强制。

@@ -420,7 +420,12 @@ class PermissionPolicy:
                     and not _programs(args, keys.program)
                     and self._program_exempt(cap.value.split(" ", 1)[0])
                 )
-                if needs_confirm and not pinned_exempt and not self._exec_exempt(args, keys):
+                if (
+                    needs_confirm
+                    and not pinned_exempt
+                    and not self._exec_exempt(args, keys)
+                    and getattr(tool, "confirm_exec", True)
+                ):
                     return Decision(True, "执行命令需确认", requires_confirmation=True)
             elif cap.kind == SECRET:
                 if self.profile == "strict":

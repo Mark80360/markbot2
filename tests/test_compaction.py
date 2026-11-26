@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
-from markbot.kernel.compaction import select_cut
+from markbot.kernel.compaction import Compactor, select_cut
 from markbot.kernel.config import load_config
 from markbot.kernel.providers.base import ModelReply
 from markbot.kernel.providers.echo import ScriptedProvider
@@ -45,7 +45,7 @@ def test_apply_compaction_replaces_prefix():
 
 def test_auto_compaction_when_budget_exceeded(make_kernel, home, project):
     cfg = load_config(home=home, project_root=project)
-    cfg.agent.context_budget_chars = 2000
+    cfg.agent.max_tokens = 700  # 预算 ≈ 2100 字符，80% 时压缩
     kernel = make_kernel(provider=_SummaryAwareProvider(), config=cfg)
 
     result = None
@@ -66,10 +66,31 @@ def test_auto_compaction_when_budget_exceeded(make_kernel, home, project):
     assert not (session_dir / "compacted.jsonl").exists()
 
 
+def test_compactor_trigger_ratio_survives_resize():
+    compactor = Compactor(None, budget_chars=10_000, trigger_ratio=0.5)  # type: ignore[arg-type]
+    assert compactor.trigger_chars == 5_000
+    compactor.resize(20_000)
+    assert compactor.trigger_chars == 10_000
+
+
+def test_auto_compaction_by_max_tokens_ratio(make_kernel, home, project):
+    cfg = load_config(home=home, project_root=project)
+    cfg.agent.max_tokens = 2_000
+    cfg.agent.context_budget_ratio = 0.8  # 触发点 = 2000 × 0.8 = 1600 token ≈ 4800 字符
+    kernel = make_kernel(provider=_SummaryAwareProvider(), config=cfg)
+
+    for index in range(4):
+        asyncio.run(kernel.run(f"第{index}轮 " + "内容" * 800, archive=False))
+
+    assert kernel.session.compaction_count >= 1
+
+    asyncio.run(kernel.shutdown())
+
+
 def test_scripted_provider_still_works_after_compaction(make_kernel, home, project):
     """压缩关闭时（预算足够大）不会额外调用模型。"""
     cfg = load_config(home=home, project_root=project)
-    cfg.agent.context_budget_chars = 1_000_000
+    cfg.agent.max_tokens = 1_000_000
     provider = ScriptedProvider(["结果"])
     kernel = make_kernel(provider=provider, config=cfg)
     result = asyncio.run(kernel.run("普通请求", archive=False))

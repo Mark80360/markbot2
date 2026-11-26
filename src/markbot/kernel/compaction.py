@@ -234,14 +234,22 @@ class CompactionOutcome:
 
 
 class Compactor:
-    def __init__(self, provider: Provider, *, budget_chars: int = 60_000) -> None:
+    def __init__(
+        self,
+        provider: Provider,
+        *,
+        budget_chars: int = 60_000,
+        trigger_ratio: float = TRIGGER_RATIO,
+    ) -> None:
         self.provider = provider
+        # 触发比例：预算的多少算「该压缩了」。context_budget_ratio 直接以此为触发点
+        self.trigger_ratio = min(0.95, max(0.1, float(trigger_ratio or TRIGGER_RATIO)))
         self.resize(budget_chars)
 
     def resize(self, budget_chars: int) -> None:
         """按新的字符预算重算阈值（token 预算校准后调用；ADR 0013）。"""
         self.budget_chars = max(2000, int(budget_chars))
-        self.trigger_chars = int(self.budget_chars * TRIGGER_RATIO)
+        self.trigger_chars = int(self.budget_chars * self.trigger_ratio)
         self.keep_chars = max(MIN_KEEP_CHARS, int(self.budget_chars * KEEP_RATIO))
         self.max_keep_chars = max(self.keep_chars, int(self.budget_chars * MAX_KEEP_RATIO))
 

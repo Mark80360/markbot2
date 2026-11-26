@@ -409,7 +409,11 @@ def test_inbox_dedupes_and_tracks_state(feishu):
 def test_recover_inbox(feishu, monkeypatch):
     gateway, store, _ = feishu
     sent: list = []
-    monkeypatch.setattr(gateway, "_send", lambda chat_id, text: (sent.append((chat_id, text)) or (True, "")))
+    monkeypatch.setattr(
+        gateway,
+        "_send",
+        lambda chat_id, text, **_: (sent.append((chat_id, text)) or (True, "")),
+    )
     store.inbox_add("event:a", json.dumps(_event("a", "om_a")))
     store.inbox_add("event:b", json.dumps(_event("b", "om_b")))
     store.inbox_mark("event:b", "processing")
@@ -454,7 +458,7 @@ def test_notify_persists_and_retries(feishu, monkeypatch):
     results = [(False, "network down"), (True, "")]
     attempts: list = []
 
-    def send(chat_id, text):
+    def send(chat_id, text, **_):
         attempts.append(text)
         return results.pop(0)
 

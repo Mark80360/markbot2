@@ -294,6 +294,20 @@ ALERT_INTERVAL_S = 600.0
 _SESSION_ID = re.compile(r"^[A-Za-z0-9_.~-]{1,160}$")
 _PROJECT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 _CHANNEL = re.compile(r"^[a-z][a-z0-9_-]{0,19}$")
+# 渠道消息 id（飞书 om_…）：后台结果回到原话题时只接受这种形状
+_MESSAGE_ID = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+
+def _notify_target(hook: dict[str, Any]) -> dict[str, str]:
+    """取渠道给出的回复位置（引用哪条消息、是否在话题内）；非法值直接忽略。"""
+    reply_to = str(hook.get("reply_to") or "").strip()
+    if not reply_to or not _MESSAGE_ID.match(reply_to):
+        return {}
+    value = hook.get("reply_in_thread")
+    in_thread = value if isinstance(value, bool) else str(value or "").lower() in {
+        "1", "true", "yes", "on",
+    }
+    return {"reply_to": reply_to, "reply_in_thread": "true" if in_thread else "false"}
 
 
 def parse_chat_request(data: Any) -> tuple[dict[str, Any] | None, str | None]:
@@ -315,6 +329,12 @@ def parse_chat_request(data: Any) -> tuple[dict[str, Any] | None, str | None]:
         _, reason = _hook_url(hook)
         if reason:
             return None, reason
+    # 后台任务结果要回到发起它的话题：只保留合法形状的回复目标
+    notify_hook = {
+        key: value
+        for key, value in notify_hook.items()
+        if key not in ("reply_to", "reply_in_thread")
+    } | _notify_target(notify_hook)
     if not prompt:
         return None, "prompt is required"
     # 只接受已登记项目的名称（不接受路径）：请求体不能把工作区指到任意目录（ADR 0013）
@@ -353,11 +373,13 @@ def execute_chat(
     project: str | None = None,
     channel: str | None = None,
     should_run: Any = None,
+    on_start: Any = None,
 ):
     """执行一个聊天回合（/chat 与异步任务共用）。确认 UI 与授权只属于本回合。
 
     ``should_run``：拿到会话锁之后再问一次是否还要执行。排在同一会话后面的任务在等锁期间
     被 /stop 取消时，不能拿到锁之后照常跑（2026-11-23：/stop 后排队的消息又跑了 112 秒）。
+    ``on_start``：确定要执行后回调，异步任务据此把状态从 queued 改成 running。
     """
     with session_scope(run_lock, session_id):
         if should_run is not None and not should_run():
@@ -366,6 +388,8 @@ def execute_chat(
             return TurnResult(
                 stopped_reason="cancelled", error="任务在开始前被取消", session_id=session_id
             )
+        if on_start is not None:
+            on_start()
         turn_ui = None
         hook_url, _ = _hook_url(confirm_hook)
         if hook_url:
@@ -381,6 +405,8 @@ def execute_chat(
         metadata: dict[str, Any] = {}
         if notify_url and notify_chat:
             metadata["notify"] = {"url": notify_url, "chat_id": notify_chat}
+            # 话题回复目标：后台任务、定时任务的结果都应回到原话题
+            metadata["notify"].update(_notify_target(notify_hook))
         if channel:
             metadata["channel"] = channel
         return asyncio.run(
@@ -464,6 +490,7 @@ def run_server(
             project=args.get("project"),
             channel=args.get("channel"),
             should_run=lambda: not record.cancel_requested,
+            on_start=args.get("_on_start"),
         )
 
     tasks = TaskManager(kernel.home, task_runner, token=auth_token, cancel=kernel.cancel)
@@ -734,6 +761,8 @@ def run_server(
                 if notify_url and request["notify_hook"].get("chat_id")
                 else {}
             )
+            if notify:
+                notify.update(_notify_target(request["notify_hook"]))
             record = tasks.submit(
                 prompt=request["prompt"],
                 session_id=session_id,

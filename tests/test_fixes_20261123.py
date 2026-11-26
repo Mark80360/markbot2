@@ -254,17 +254,71 @@ def test_feishu_task_wait_caps_soft_timeout(feishu, monkeypatch):
     clock = {"t": 0.0}
     monkeypatch.setattr(_module.time, "monotonic", lambda: clock["t"])
 
+    polls: list[int] = []
+
     def fake_call(method, path, payload=None, timeout=None):
         if method == "POST" and path == "/tasks":
             return 202, {"task_id": "task_1", "session_id": "sess_1"}
         if path.endswith("/detach"):
             return 200, {"state": "running"}
+        if not polls:
+            # 第一次轮询就拿到 running：从这一刻开始计算 task_wait_s
+            polls.append(1)
+            return 200, {"events": [{"seq": 2, "type": "status", "state": "running"}], "next": 2}
         clock["t"] += 31.0  # 一次长轮询之后就超过 30 秒
-        return 200, {"events": [], "next": 0}
+        return 200, {"events": [], "next": 2}
 
     monkeypatch.setattr(gateway, "_markbot_call", fake_call)
     result = gateway._run_task({"prompt": "x"}, chat_key="", on_delta=None)
     assert result["stopped_reason"] == "detached"
+
+
+def test_feishu_queue_wait_not_charged_to_task_wait(feishu, monkeypatch):
+    """排队等锁的时间不计入 task_wait_s；开始执行后才按预算放手。"""
+    _module, settings, gateway = feishu
+    import dataclasses
+
+    gateway._settings = dataclasses.replace(settings, task_wait_s=30.0)
+    clock = {"t": 0.0}
+    monkeypatch.setattr(_module.time, "monotonic", lambda: clock["t"])
+    polls: list[int] = []
+
+    def fake_call(method, path, payload=None, timeout=None):
+        if method == "POST" and path == "/tasks":
+            return 202, {"task_id": "task_1", "session_id": "sess_1"}
+        polls.append(1)
+        if len(polls) == 1:
+            clock["t"] += 90.0  # 排队 90 秒，任务还没开始
+            return 200, {"events": [], "next": 0}
+        if len(polls) == 2:
+            return 200, {"events": [{"seq": 2, "type": "status", "state": "running"}], "next": 2}
+        clock["t"] += 20.0
+        return 200, {"events": [{"seq": 3, "type": "done", "text": "好了",
+                                 "stopped_reason": "completed", "session_id": "sess_1"}], "next": 3}
+
+    monkeypatch.setattr(gateway, "_markbot_call", fake_call)
+    result = gateway._run_task({"prompt": "x"}, chat_key="", on_delta=None)
+    assert result["text"] == "好了"
+
+
+def test_feishu_queued_task_replies_immediately(feishu, monkeypatch):
+    """同一会话前面还有任务：立即回复排队提示并放手，不再干等 120 秒。"""
+    _module, _settings, gateway = feishu
+    calls: list = []
+
+    def fake_call(method, path, payload=None, timeout=None):
+        calls.append((method, path))
+        if method == "POST" and path == "/tasks":
+            return 202, {"task_id": "task_q", "session_id": "sess_q", "queued_ahead": 1}
+        if path.endswith("/detach"):
+            return 200, {"state": "queued"}
+        raise AssertionError("排队中的任务不应继续长轮询")
+
+    monkeypatch.setattr(gateway, "_markbot_call", fake_call)
+    result = gateway._run_task({"prompt": "好了吗"}, chat_key="", on_delta=None)
+    assert result["stopped_reason"] == "detached"
+    assert "排队" in result["text"]
+    assert calls[-1] == ("POST", "/tasks/task_q/detach")
 
 
 def test_browser_display_setting(monkeypatch):

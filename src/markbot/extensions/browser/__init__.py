@@ -18,7 +18,8 @@
   - 每一次页面导航（包括点击链接、重定向、iframe）都经过地址检查：只允许 http(s)，
     ``blocked_domains`` / ``allowed_domains``，以及与 ``fetch_url`` 相同的内网地址限制（``[tools.web] allow_private``）；
   - ``confirm = "risky"``（默认）：看起来会产生后果的点击（提交、发送、购买、支付、删除、发布……）、
-    输入后回车提交、执行脚本、上传文件要用户确认；``"all"`` 所有点击/输入都确认；``"none"`` 不确认；
+    输入后回车提交、上传文件要用户确认；执行脚本默认不确认，需要时设 ``confirm_script = true``；
+    ``"all"`` 所有点击/输入/脚本都确认；``"none"`` 不确认；
     无人值守的定时任务没有确认对象，这些动作会被拒绝；
   - 输入密码等敏感值用 ``secret``：只能取 ``[tools.browser] secrets`` 里登记的密钥名，值不会出现在模型上下文与日志；
   - 能力声明 ``browser:*``：strict 档位下整体禁用。
@@ -102,6 +103,8 @@ class BrowserSettings:
     allowed_domains: list[str] = field(default_factory=list)
     blocked_domains: list[str] = field(default_factory=list)
     confirm: str = "risky"
+    # risky 档位下是否单独确认「在网页里执行脚本」；默认不确认，避免每次 eval 都打断
+    confirm_script: bool = False
     secrets: list[str] = field(default_factory=list)
     idle_timeout_s: float = 900.0
     navigation_timeout_s: float = 30.0
@@ -116,6 +119,14 @@ def _list(value: Any) -> list[str]:
     if isinstance(value, str):
         value = [value]
     return [str(item).strip().lower() for item in value or [] if str(item).strip()]
+
+
+def _bool(value: Any, *, default: bool) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, str):
+        return value.strip().lower() in {"true", "1", "yes", "on"}
+    return bool(value)
 
 
 def parse_settings(config: Any) -> BrowserSettings:
@@ -138,6 +149,7 @@ def parse_settings(config: Any) -> BrowserSettings:
     settings.secrets = [str(item).strip() for item in raw.get("secrets") or [] if str(item).strip()]
     confirm = str(raw.get("confirm") or "risky").strip().lower()
     settings.confirm = confirm if confirm in {"risky", "all", "none"} else "risky"
+    settings.confirm_script = _bool(raw.get("confirm_script"), default=False)
     if not settings.proxy and isinstance(web, dict):
         settings.proxy = str(web.get("proxy") or "")
     return settings
@@ -848,9 +860,10 @@ def setup(api: ExtensionAPI) -> None:
         return ToolResult(content=await _run(ctx, tabs))
 
     async def browser_eval(ctx: Any, args: EvalIn) -> ToolResult:
-        if settings.confirm != "none" and not await _confirm(
-            ctx, "确认在网页中执行脚本", args.script[:1500]
-        ):
+        if (
+            settings.confirm == "all"
+            or (settings.confirm == "risky" and settings.confirm_script)
+        ) and not await _confirm(ctx, "确认在网页中执行脚本", args.script[:1500]):
             return _denied("执行脚本")
 
         async def run_js(page: Any) -> Any:

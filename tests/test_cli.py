@@ -28,7 +28,7 @@ def test_init_creates_layout(tmp_path, monkeypatch):
         assert (home / name).exists(), name
     text = (home / "config.toml").read_text(encoding="utf-8")
     assert "[agent]" in text
-    assert "context_budget_chars" in text
+    assert "context_budget_ratio" in text
 
 
 def test_init_keeps_existing_config(tmp_path, monkeypatch):

@@ -72,6 +72,10 @@ class Tool:
     # 并行工具调用时能否与其它调用同时执行（ADR 0012）。None = 按能力推断：
     # 声明了 fs.write / exec 的工具不并发（避免并发写同一文件、命令互相干扰）
     concurrency_safe: bool | None = None
+    # 声明 exec 能力的工具是否走通用「执行命令需确认」。自身已做危险操作守卫
+    # （如 kill_process 拒绝结束自身/父进程/系统关键进程）时可置 False；
+    # 能力范围、受保护路径与 strict 档位仍然生效。
+    confirm_exec: bool = True
 
     def is_concurrency_safe(self) -> bool:
         if self.concurrency_safe is not None:

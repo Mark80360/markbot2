@@ -389,6 +389,10 @@ def test_kill_process_guards(tmp_path):
     assert own.is_error and own.details.get("denied")
     strict = _ctx(tmp_path, profile="strict")
     assert not strict.policy.check(tool, {"pid": 12345}).allowed
+    # 自身已做危险进程守卫：standard / trusted 档位直接执行，不再要求确认
+    for profile in ("standard", "trusted"):
+        decision = _ctx(tmp_path, profile=profile).policy.check(tool, {"pid": 12345})
+        assert decision.allowed and not decision.requires_confirmation, decision.reason
     assert sysops.human(1536) == "1.5 KB"
 
 

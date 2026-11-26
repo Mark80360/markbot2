@@ -1,7 +1,8 @@
 """系统运维（ADR 0015）：查看本机状态、进程、磁盘、端口与服务。
 
 只读工具不声明能力（不访问工作区文件、不执行任意命令）：内部只运行固定的系统查询命令。
-``kill_process`` 声明 ``exec:*``，由权限策略按执行命令的规则确认（strict 禁止）；不允许结束自身、父进程与系统关键进程。
+``kill_process`` 声明 ``exec:*`` 但默认不走通用确认（``confirm_exec=False``；strict 档位仍禁止），
+因为它自身拒绝结束 MarkBot、父进程与系统关键进程。
 
 有 psutil（``pip install -e ".[sysops]"``）时信息更完整；没有时退回 /proc、ps、tasklist 等。
 """
@@ -384,11 +385,20 @@ def setup(api: ExtensionAPI) -> None:
         ("disk_usage", "查看分区剩余空间与目录下占用最大的项目", DiskIn, disk_usage, frozenset({"fs.read:./**"}), 30.0),
         ("check_port", "检查主机端口能否连接（排查服务是否在线）", PortIn, check_port, frozenset({"net:*"}), 40.0),
         ("service_status", "查看 systemd 服务 / Windows 服务或计划任务的状态与最近日志", ServiceIn, service_status, frozenset(), 30.0),
-        ("kill_process", "结束进程（按执行命令的权限规则确认）", KillIn, kill_process, frozenset({"exec:*"}), 30.0),
+        ("kill_process", "结束进程（拒绝自身、父进程与系统关键进程）", KillIn, kill_process, frozenset({"exec:*"}), 30.0),
     ]
     for name, description, params, fn, caps, timeout in specs:
         api.register_tool(
-            Tool(name=name, description=description, params=params, handler=fn, capabilities=caps, timeout_s=timeout)
+            Tool(
+                name=name,
+                description=description,
+                params=params,
+                handler=fn,
+                capabilities=caps,
+                timeout_s=timeout,
+                # kill_process 自己已做危险进程守卫，不再走通用 exec 确认
+                confirm_exec=(name != "kill_process"),
+            )
         )
 
 

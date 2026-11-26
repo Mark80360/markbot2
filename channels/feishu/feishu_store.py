@@ -51,9 +51,23 @@ class Store:
             "CREATE TABLE IF NOT EXISTS outbox ("
             "id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id TEXT NOT NULL, text TEXT NOT NULL, "
             "state TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, next_at REAL NOT NULL, "
-            "error TEXT, created_at REAL NOT NULL)"
+            "error TEXT, created_at REAL NOT NULL, reply_to TEXT, "
+            "reply_in_thread INTEGER NOT NULL DEFAULT 0)"
         )
+        self._migrate_outbox()
         self._conn.commit()
+
+    def _migrate_outbox(self) -> None:
+        """旧库补上话题回复字段：后台任务结果要回到原话题，重试时也不能丢。"""
+        columns = {
+            str(row[1]) for row in self._conn.execute("PRAGMA table_info(outbox)").fetchall()
+        }
+        if "reply_to" not in columns:
+            self._conn.execute("ALTER TABLE outbox ADD COLUMN reply_to TEXT")
+        if "reply_in_thread" not in columns:
+            self._conn.execute(
+                "ALTER TABLE outbox ADD COLUMN reply_in_thread INTEGER NOT NULL DEFAULT 0"
+            )
 
     def first_seen(self, key: str) -> bool:
         now = datetime.now().astimezone().isoformat(timespec="seconds")
@@ -196,14 +210,22 @@ class Store:
         return [_inbox_row(row) for row in rows]
 
     # ------------------------------------------------------------ 发件箱
-    def outbox_add(self, chat_id: str, text: str, *, lease_s: float = 60) -> int:
+    def outbox_add(
+        self,
+        chat_id: str,
+        text: str,
+        *,
+        reply_to: str | None = None,
+        reply_in_thread: bool = False,
+        lease_s: float = 60,
+    ) -> int:
         """登记一条待发送的消息，状态 sending（带租约：调用方马上尝试发送）。"""
         now = time.time()
         with self._lock:
             cursor = self._conn.execute(
-                "INSERT INTO outbox(chat_id, text, state, attempts, next_at, created_at) "
-                "VALUES (?, ?, 'sending', 0, ?, ?)",
-                (chat_id, text, now + lease_s, now),
+                "INSERT INTO outbox(chat_id, text, state, attempts, next_at, created_at, "
+                "reply_to, reply_in_thread) VALUES (?, ?, 'sending', 0, ?, ?, ?, ?)",
+                (chat_id, text, now + lease_s, now, reply_to, int(reply_in_thread)),
             )
             self._conn.commit()
             return int(cursor.lastrowid or 0)
@@ -213,7 +235,7 @@ class Store:
         now = time.time()
         with self._lock:
             rows = self._conn.execute(
-                "SELECT id, chat_id, text, attempts FROM outbox "
+                "SELECT id, chat_id, text, attempts, reply_to, reply_in_thread FROM outbox "
                 "WHERE state IN ('pending', 'sending') AND next_at <= ? ORDER BY id LIMIT ?",
                 (now, limit),
             ).fetchall()
@@ -224,7 +246,15 @@ class Store:
                 )
             self._conn.commit()
         return [
-            {"id": row[0], "chat_id": row[1], "text": row[2], "attempts": row[3]} for row in rows
+            {
+                "id": row[0],
+                "chat_id": row[1],
+                "text": row[2],
+                "attempts": row[3],
+                "reply_to": row[4] or None,
+                "reply_in_thread": bool(row[5]),
+            }
+            for row in rows
         ]
 
     def outbox_result(

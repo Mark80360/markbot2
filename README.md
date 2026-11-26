@@ -144,7 +144,7 @@ max_steps = 30
 tool_timeout_s = 60
 parallel_tools = true
 max_concurrent_turns = 4       # serve/gateway 同时执行的回合数；同一会话始终串行
-context_budget_chars = 60000   # 字符预算：超过 80% 触发压缩，压缩后保留最近约 40%
+context_budget_ratio = 0.8     # 用量达到 max_tokens 的 80% 时触发上下文压缩
 
 [permissions]
 profile = "standard"           # strict | standard | trusted
@@ -348,7 +348,6 @@ markbot eval --suite coding                       # 在 evals/coding/ 的小仓�
 
 ```toml
 [agent]
-context_budget_tokens = 80000   # 按 token 管理上下文预算（自动校准字符/token 比例）；0 则用 context_budget_chars
 prompt_cache = "auto"           # Anthropic 提示缓存：auto 仅官方接口开启
 
 [subagents]
@@ -835,7 +834,8 @@ cli 依赖 kernel + optimizer
 - `fetch_url` 默认输出正文 Markdown（保留标题、列表、绝对链接），支持 PDF 文本（`.[pdf]`），自动重试与缓存。
 - 内置浏览器（`.[browser]` + `playwright install chromium`，或 `[tools.browser] channel = "msedge"`）：
   `browser_open/snapshot/click/type/...`，按元素编号操作，持久登录态，导航地址检查，
-  提交/付款/删除等操作需确认，`browser_handoff` 请用户接手验证码。
+  提交/付款/删除等操作需确认，`browser_handoff` 请用户接手验证码。执行脚本默认不确认，
+  需要时设 `[tools.browser] confirm_script = true`（`confirm = "all"` 时仍会确认）。
 - 新能力类型 `browser:<域名|*>`、`desktop:<应用|*>`；strict 档位禁止。
 - 详见 `docs/phase3-batch1-implementation-2026-11-23.md`。
 
@@ -845,7 +845,7 @@ cli 依赖 kernel + optimizer
   `vision_max_images = 3` 控制每次请求最多附带的图片数；主模型不能看图时 `view_image` 交给 `[agent.roles.vision]` 描述。
 - 桌面控制（默认关闭，`[tools.desktop] enabled = true`，`.[desktop]`）：截图 → 坐标/控件编号点击、输入、按键，动作后自动截图；
   每会话首个动作需确认，密码管理器等应用默认禁止操作。
-- 运维工具：`system_info`、`list_processes`、`disk_usage`、`check_port`、`service_status`、`kill_process`（需确认）；
+- 运维工具：`system_info`、`list_processes`、`disk_usage`、`check_port`、`service_status`、`kill_process`（默认无需确认，拒绝结束自身/父进程/系统关键进程，strict 档位禁止）；
   安装 `.[sysops]`（psutil）后信息更完整。
 - 浏览器评测：`markbot eval --suite browser`（`evals/browser/` 5 个用例）。
 - 详见 `docs/phase3-batch2-implementation-2026-11-23.md`。

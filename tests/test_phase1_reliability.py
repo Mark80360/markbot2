@@ -159,6 +159,52 @@ def test_task_streams_events_and_completes(tmp_path):
     assert "全部完成" in saved
 
 
+def test_task_queued_until_runner_starts(tmp_path):
+    """拿到会话锁之前保持 queued；执行器回调 _on_start 后才转 running。"""
+    entered = threading.Event()
+    release = threading.Event()
+    captured: dict = {}
+
+    def runner(record, args, on_delta, on_event):
+        captured.update(args)
+        entered.set()
+        release.wait(5)
+        return _Result(text="好", stopped_reason="completed", error=None,
+                       session_id=record.session_id)
+
+    manager, _ = _manager(tmp_path, runner)
+    record = manager.submit(prompt="排队", session_id="sess_q")
+    assert entered.wait(5)
+    assert manager.get(record.task_id).state == "queued"
+    captured["_on_start"]()
+    assert manager.get(record.task_id).state == "running"
+    release.set()
+    _wait_state(manager, record.task_id)
+    assert manager.get(record.task_id).state == "completed"
+
+
+def test_submit_reports_tasks_ahead_in_same_session(tmp_path):
+    release = threading.Event()
+
+    def runner(record, args, on_delta, on_event):
+        release.wait(5)
+        return _Result(text="", stopped_reason="completed", error=None,
+                       session_id=record.session_id)
+
+    manager, _ = _manager(tmp_path, runner)
+    first = manager.submit(prompt="一", session_id="sess_b")
+    second = manager.submit(prompt="二", session_id="sess_b")
+    third = manager.submit(prompt="三", session_id="sess_b")
+    assert second.queued_ahead == 1
+    assert third.queued_ahead == 2
+    assert second.state == "queued" and third.state == "queued"
+    # 不同会话不受影响
+    assert manager.submit(prompt="别的会话", session_id="sess_other").queued_ahead == 0
+    release.set()
+    for item in (first, second, third):
+        _wait_state(manager, item.task_id)
+
+
 def test_detached_task_pushes_result(tmp_path):
     gate = threading.Event()
 
@@ -216,6 +262,7 @@ def test_task_cancel_calls_kernel(tmp_path):
     cancelled: list[str] = []
 
     def runner(record, args, on_delta, on_event):
+        args["_on_start"]()
         started.set()
         release.wait(5)
         return _Result(text="", stopped_reason="cancelled", error="已被用户取消",
@@ -250,6 +297,7 @@ def test_restart_marks_running_tasks_interrupted(tmp_path):
     block = threading.Event()
 
     def runner(record, args, on_delta, on_event):
+        args["_on_start"]()
         block.wait(10)
         return _Result(text="", stopped_reason="completed", error=None, session_id="s")
 
@@ -281,6 +329,38 @@ def test_parse_chat_request_validation():
     bad = parse_chat_request({"prompt": "x", "notify_hook": {"url": "http://evil.example/n"}})
     assert bad[1] and "local" in bad[1]
     assert parse_chat_request("not a dict")[1] == "invalid json"
+
+
+def test_parse_chat_request_keeps_valid_notify_target():
+    """后台任务结果要能回到原话题；非法消息 id 不能穿透到渠道。"""
+    from markbot.server.http import parse_chat_request
+
+    ok, error = parse_chat_request(
+        {
+            "prompt": "hi",
+            "notify_hook": {
+                "url": "http://127.0.0.1:8790/notify",
+                "chat_id": "oc_1",
+                "reply_to": "om_abc123",
+                "reply_in_thread": True,
+            },
+        }
+    )
+    assert error is None
+    assert ok["notify_hook"]["reply_to"] == "om_abc123"
+    assert ok["notify_hook"]["reply_in_thread"] == "true"
+
+    dirty, _ = parse_chat_request(
+        {
+            "prompt": "hi",
+            "notify_hook": {
+                "url": "http://127.0.0.1:8790/notify",
+                "chat_id": "oc_1",
+                "reply_to": "../../etc/passwd",
+            },
+        }
+    )
+    assert "reply_to" not in dirty["notify_hook"]
 
 
 # ===================================================================== 组件守护

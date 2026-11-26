@@ -6,6 +6,8 @@
 新模型：
 
 - ``submit`` 登记任务并在独立线程里执行（仍经 ``RunGate`` 限流、同会话串行）；
+  任务在拿到会话锁之前保持 ``queued``，开始执行时才转 ``running``（``queued_ahead`` 给出前面
+  还有几个同会话任务），渠道据此区分「在运行」和「在排队」；
 - 进度（流式文本、工具调用、状态）进入内存事件缓冲，客户端按序号长轮询续读，
   断线重连不丢不重；
 - 任务元数据持久化到 ``<home>/tasks/<task_id>.json``（只有状态与结果摘要，会话事实仍以
@@ -73,6 +75,8 @@ class TaskRecord:
     cancel_requested: bool = False
     tool_calls: int = 0
     current_tool: str | None = None
+    # 提交时同一会话里排在它前面的任务数；大于 0 表示还没轮到它执行
+    queued_ahead: int = 0
 
     def as_dict(self) -> dict[str, Any]:
         data = asdict(self)
@@ -138,6 +142,12 @@ class TaskManager:
         )
         with self._cond:
             self._gc_locked()
+            # 同一会话串行：提交时先记下前面还有几个未结束的任务，供渠道立刻提示「排队中」
+            record.queued_ahead = sum(
+                1
+                for item in self._records.values()
+                if item.session_id == session_id and item.state in ACTIVE_STATES
+            )
             self._records[record.task_id] = record
             self._events[record.task_id] = []
             self._args[record.task_id] = {"prompt": prompt, **(args or {})}
@@ -158,15 +168,13 @@ class TaskManager:
             record = self._records[task_id]
             args = self._args.get(task_id, {})
             cancelled_early = record.cancel_requested
-            if not cancelled_early:
-                record.state = "running"
-                record.started_at = _now()
         if cancelled_early:
             self._finish(task_id, state="cancelled", text="", error="任务在开始前被取消",
                          stopped_reason="cancelled")
             return
-        self._persist(record)
-        self._emit(task_id, {"type": "status", "state": "running"})
+        # 执行器拿到会话锁、真正开始回合时回调；在那之前任务保持 queued，
+        # 渠道才能区分「在排队」和「正在执行」。
+        args["_on_start"] = lambda: self._mark_started(task_id)
 
         def on_delta(text: str) -> None:
             if text:
@@ -207,6 +215,17 @@ class TaskManager:
             stopped_reason=reason,
             session_id=getattr(result, "session_id", None),
         )
+
+    def _mark_started(self, task_id: str) -> None:
+        """回合真正开始（已拿到会话锁）时调用：queued -> running。"""
+        with self._cond:
+            record = self._records.get(task_id)
+            if record is None or record.state != "queued":
+                return
+            record.state = "running"
+            record.started_at = _now()
+        self._persist(record)
+        self._emit(task_id, {"type": "status", "state": "running"})
 
     def _finish(
         self,
@@ -397,7 +416,12 @@ class TaskManager:
         chat_id = str(notify.get("chat_id") or "")
         if not url or not chat_id or not local_auth.is_local_url(url):
             return False
-        body = json.dumps({"chat_id": chat_id, "text": text}, ensure_ascii=False).encode("utf-8")
+        body_data: dict[str, Any] = {"chat_id": chat_id, "text": text}
+        # 回到发起任务的话题：渠道侧据此在话题内回复，而不是把结果丢到群里
+        for key in ("reply_to", "reply_in_thread"):
+            if notify.get(key):
+                body_data[key] = notify[key]
+        body = json.dumps(body_data, ensure_ascii=False).encode("utf-8")
         headers = {"Content-Type": "application/json"}
         if self._token:
             headers[local_auth.HEADER] = self._token

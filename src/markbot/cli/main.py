@@ -230,7 +230,7 @@ request_timeout_s = 120        # 单次模型请求超时
 max_retries = 2                # 模型请求失败后的重试次数（总尝试 = max_retries + 1）
 retry_backoff_s = 2            # 重试退避基数，第 n 次重试等待 base * 2^(n-1) 秒
 parallel_tools = true
-context_budget_chars = 60000   # 超过 80% 触发上下文压缩
+context_budget_ratio = 0.8     # 用量达到 max_tokens 的 80% 时触发上下文压缩
 tool_result_max_chars = 16000  # 单条工具结果超限落盘，上下文只留预览与路径
 
 [permissions]

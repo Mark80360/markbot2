@@ -69,6 +69,8 @@ class _TasksUnsupported(Exception):
 
 def _format_status(data: dict[str, Any]) -> str:
     lines: list[str] = []
+    tasks = data.get("tasks") or []
+    queued = sum(1 for item in tasks if item.get("state") == "queued")
     if data.get("running"):
         lines.append(
             f"▶️ 正在执行：第 {data.get('steps', 0)} 步，已调用工具 {data.get('tool_calls', 0)} 次，"
@@ -77,7 +79,9 @@ def _format_status(data: dict[str, Any]) -> str:
         if data.get("current_tool"):
             lines.append(f"当前工具：{data['current_tool']}")
     else:
-        lines.append("当前没有正在执行的回合。")
+        lines.append(
+            "当前没有正在执行的回合。" + (f"（{queued} 个任务排队中）" if queued else "")
+        )
     todos = data.get("todos") or []
     if todos:
         marks = {"pending": "⬜", "in_progress": "🔄", "completed": "✅", "cancelled": "➖"}
@@ -86,9 +90,10 @@ def _format_status(data: dict[str, Any]) -> str:
         lines.extend(
             f"{marks.get(item.get('status'), '⬜')} {item.get('content', '')}" for item in todos[:15]
         )
-    for task in (data.get("tasks") or [])[:5]:
+    for task in tasks[:5]:
+        state = "排队中" if task.get("state") == "queued" else task.get("state")
         lines.append(
-            f"- {task.get('state')} · {task.get('prompt_preview', '')} · {task.get('elapsed_s', 0)}s"
+            f"- {state} · {task.get('prompt_preview', '')} · {task.get('elapsed_s', 0)}s"
         )
     lines.append("发送 /stop 停止当前任务，/retry 重新执行上一条请求。")
     return "\n".join(lines)
@@ -511,13 +516,32 @@ class Gateway:
         return counts
 
     # ------------------------------------------------------------ 发件箱
-    def _send(self, chat_id: str, text: str) -> tuple[bool, str]:
+    def _send(
+        self,
+        chat_id: str,
+        text: str,
+        *,
+        reply_to: str | None = None,
+        reply_in_thread: bool = False,
+    ) -> tuple[bool, str]:
         # 后台任务结果、定时任务结果里的 ![..](本地路径) 同样作为图片/文件发出
         media = _extract_local_media(text)
         try:
             if media:
-                return bool(self._client.send_answer(chat_id, text, media=media)), ""
-            return bool(self._client.send_answer(chat_id, text)), ""
+                return bool(
+                    self._client.send_answer(
+                        chat_id,
+                        text,
+                        media=media,
+                        reply_to=reply_to,
+                        reply_in_thread=reply_in_thread,
+                    )
+                ), ""
+            return bool(
+                self._client.send_answer(
+                    chat_id, text, reply_to=reply_to, reply_in_thread=reply_in_thread
+                )
+            ), ""
         except Exception as exc:  # noqa: BLE001 - 由发件箱重试
             return False, f"{type(exc).__name__}: {exc}"
 
@@ -528,7 +552,12 @@ class Gateway:
             self._outbox_wake.clear()
             try:
                 for item in self._store.outbox_due():
-                    ok, error = self._send(item["chat_id"], item["text"])
+                    ok, error = self._send(
+                        item["chat_id"],
+                        item["text"],
+                        reply_to=item.get("reply_to"),
+                        reply_in_thread=bool(item.get("reply_in_thread")),
+                    )
                     state = self._store.outbox_result(item["id"], ok, error=error)
                     log(
                         f"发件箱重试 id={item['id']} chat={item['chat_id']} "
@@ -634,6 +663,8 @@ class Gateway:
                 chat_key=chat_key,
                 chat_id=chat_id,
                 sender_id=sender_id,
+                reply_to=reply_to,
+                reply_in_thread=reply_in_thread,
                 on_delta=stream.feed if stream is not None else None,
             )
         except Exception as exc:  # noqa: BLE001 - 失败要落日志并告知用户，不能静默
@@ -644,7 +675,12 @@ class Gateway:
             )
             failure = _failure_text(exc, elapsed)
             if not (stream is not None and stream.finish(failure)):
-                self._reply(chat_id, failure)
+                self._reply(
+                    chat_id,
+                    failure,
+                    reply_to=reply_to,
+                    reply_in_thread=reply_in_thread,
+                )
             return
         finally:
             # “本轮不再确认”只在本次问答内有效，回合结束就失效
@@ -846,7 +882,12 @@ class Gateway:
     def _chat_key(self, chat_id: str, chat_type: str, message: dict[str, Any]) -> str:
         """群内按话题隔离上下文；私聊固定为 chat_id。"""
         if chat_type in ("group", "topic") and self._settings.topic_isolation:
-            thread_key = str(message.get("root_id") or message.get("message_id") or "")
+            thread_key = str(
+                message.get("thread_id")
+                or message.get("root_id")
+                or message.get("message_id")
+                or ""
+            )
             if thread_key:
                 return f"feishu:{chat_id}:{thread_key}"
         return f"feishu:{chat_id}"
@@ -859,6 +900,9 @@ class Gateway:
             return None, False
         # 话题群里的消息自带 thread_id：无论在哪个话题里交互，回复都留在该话题内
         if message.get("thread_id"):
+            return message_id, True
+        # 话题群（chat_type=topic）的消息即使事件里没带 thread_id，也按话题内回复处理
+        if chat_type == "topic":
             return message_id, True
         if self._settings.reply_to_message:
             return message_id, chat_type in ("group", "topic")
@@ -876,7 +920,12 @@ class Gateway:
         if stripped in ("/new", "新会话"):
             self._store.clear_session(chat_key)
             log(f"已清除会话映射 {chat_key}")
-            self._reply(chat_id, "已开始新会话。", reply_to=reply_to)
+            self._reply(
+                chat_id,
+                "已开始新会话。",
+                reply_to=reply_to,
+                reply_in_thread=reply_in_thread,
+            )
             return True
         if stripped == "/session":
             session_id = self._store.get_session(chat_key)
@@ -969,6 +1018,8 @@ class Gateway:
         chat_key: str = "",
         chat_id: str = "",
         sender_id: str = "",
+        reply_to: str | None = None,
+        reply_in_thread: bool = False,
         on_delta: Any = None,
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {"prompt": prompt}
@@ -989,6 +1040,10 @@ class Gateway:
         # 定时任务等后台流程要主动发消息时，通过这个回调回到原聊天
         if chat_id:
             payload["notify_hook"] = {"url": self.notify_hook, "chat_id": chat_id}
+            # 本回合发生在话题里时，后台任务结果也要回到同一个话题，而不是群里
+            if reply_to:
+                payload["notify_hook"]["reply_to"] = reply_to
+                payload["notify_hook"]["reply_in_thread"] = reply_in_thread
         # 告诉服务端回复发往飞书：模型据此知道可以在回复里嵌入本地图片/文件
         payload["channel"] = "feishu"
         if getattr(self._settings, "async_tasks", True) and self._tasks_supported:
@@ -1102,8 +1157,12 @@ class Gateway:
     def _run_task(
         self, payload: dict[str, Any], *, chat_key: str, on_delta: Any
     ) -> dict[str, Any]:
-        """提交异步任务并长轮询事件；等待超过 markbot_timeout_s 后放手，由服务端推送结果。"""
-        started = time.monotonic()
+        """提交异步任务并长轮询事件；等待超过预算后放手，由服务端推送结果。
+
+        同一会话串行：前面还有任务在跑时立即告知并放手，不让工作线程卡在队列里；
+        ``task_wait_s`` 只从回合真正开始执行（服务端状态转 running）时算起。
+        """
+        submitted = time.monotonic()
         status, task = self._markbot_call("POST", "/tasks", payload, timeout=30)
         if status == 404:
             raise _TasksUnsupported()
@@ -1119,14 +1178,46 @@ class Gateway:
             # 提交即建立会话映射：即使本次等待放手，后续消息也接在同一个会话上
             self._store.set_session(chat_key, session_id)
         log(f"已提交任务 {task_id} session={session_id} 软超时={self._settings.markbot_timeout_s}s")
+        ahead = int(task.get("queued_ahead") or 0)
+        if ahead > 0:
+            # 同一会话串行：前面还有任务在跑。立刻告知并放手，避免工作线程卡在队列里，
+            # 否则这条消息后面的新消息又会排队。结果仍由服务端在完成时推送回来。
+            status, record = self._markbot_call("POST", f"/tasks/{task_id}/detach", {})
+            if status == 200 and record.get("state") in {
+                "completed", "failed", "cancelled", "interrupted",
+            }:
+                return {
+                    "text": record.get("text") or "",
+                    "stopped_reason": record.get("stopped_reason"),
+                    "error": record.get("error"),
+                    "session_id": record.get("session_id") or session_id,
+                }
+            log(f"任务 {task_id} 排队中（前面 {ahead} 个），已转后台推送")
+            return {
+                "text": (
+                    f"⏳ 当前任务还在执行，你的消息已排队（前面还有 {ahead} 个任务）。"
+                    "轮到它后会直接回复你；发送 /status 查看进度，/stop 停止。"
+                ),
+                "stopped_reason": "detached",
+                "error": None,
+                "session_id": session_id,
+            }
         after = 0
         failures = 0
         soft_limit = max(30.0, float(self._settings.markbot_timeout_s))
         task_wait = float(getattr(self._settings, "task_wait_s", 0) or 0)
         if task_wait > 0:
             soft_limit = min(soft_limit, max(30.0, task_wait))
+        # 排队等锁的阶段不计入 soft_limit，单独给一个宽松上限防止工作线程被永久占用
+        queue_limit = max(soft_limit, float(self._settings.markbot_timeout_s))
+        run_started: float | None = None
         while True:
-            remaining = soft_limit - (time.monotonic() - started)
+            now = time.monotonic()
+            remaining = (
+                soft_limit - (now - run_started)
+                if run_started is not None
+                else queue_limit - (now - submitted)
+            )
             if remaining <= 0:
                 return self._detach_task(task_id, session_id)
             wait = min(25.0, max(1.0, remaining))
@@ -1141,14 +1232,20 @@ class Gateway:
                 time.sleep(min(10.0, 1.0 * failures))
                 continue
             failures = 0
+            # 兼容旧服务端（没有 queued 阶段）：任务元数据已经是 running 就按已开始计时
+            if run_started is None and (data.get("task") or {}).get("state") == "running":
+                run_started = time.monotonic()
             for event in data.get("events") or []:
                 kind = event.get("type")
-                if kind == "delta" and on_delta is not None:
+                if kind == "status" and event.get("state") == "running" and run_started is None:
+                    # 回合真正开始执行：从这里起计算 task_wait_s，排队时间不计入
+                    run_started = time.monotonic()
+                elif kind == "delta" and on_delta is not None:
                     text = event.get("text")
                     if isinstance(text, str) and text:
                         on_delta(text)
                 elif kind == "done":
-                    log(f"任务完成 {task_id} 耗时={time.monotonic() - started:.1f}s state={event.get('state')}")
+                    log(f"任务完成 {task_id} 耗时={time.monotonic() - submitted:.1f}s state={event.get('state')}")
                     return {
                         "text": event.get("text") or "",
                         "stopped_reason": event.get("stopped_reason"),
@@ -1234,23 +1331,37 @@ class Gateway:
         except Exception as exc:  # noqa: BLE001
             log(f"发送飞书消息失败 chat={chat_id}: {exc}")
 
-    def notify(self, chat_id: str, text: str) -> bool:
+    def notify(
+        self,
+        chat_id: str,
+        text: str,
+        *,
+        reply_to: str | None = None,
+        reply_in_thread: bool = False,
+    ) -> bool:
         """后台流程主动发消息（定时任务结果、后台任务结果、告警）。
 
         先写发件箱再发送：发送失败由 :meth:`outbox_worker` 退避重试，渠道重启也不丢（ADR 0011）。
+        ``reply_to`` / ``reply_in_thread`` 让结果回到发起任务的话题，而不是群里。
         返回 True 表示已接收（已落库），不代表已送达。
         """
         chat_id = str(chat_id or "").strip()
         text = str(text or "").strip()
         if not chat_id or not text:
             return False
-        log(f"主动通知 chat={chat_id} 长度={len(text)}")
+        log(f"主动通知 chat={chat_id} 长度={len(text)} 话题={reply_to or '-'}")
         try:
-            item_id = self._store.outbox_add(chat_id, text)
+            item_id = self._store.outbox_add(
+                chat_id, text, reply_to=reply_to, reply_in_thread=reply_in_thread
+            )
         except Exception as exc:  # noqa: BLE001 - 落库失败时至少尝试直接发送
             log(f"发件箱写入失败，直接发送 chat={chat_id}: {exc}")
-            return self._send(chat_id, text)[0]
-        ok, error = self._send(chat_id, text)
+            return self._send(
+                chat_id, text, reply_to=reply_to, reply_in_thread=reply_in_thread
+            )[0]
+        ok, error = self._send(
+            chat_id, text, reply_to=reply_to, reply_in_thread=reply_in_thread
+        )
         state = self._store.outbox_result(item_id, ok, error=error)
         if not ok:
             log(f"主动通知发送失败，已进入发件箱重试 id={item_id} state={state}: {error or '-'}")

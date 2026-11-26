@@ -276,8 +276,10 @@ class Kernel:
         env = self._make_env(self.policy)
         self.env = env
         self._scopes = {}
-        token_budget = int(getattr(self.config.agent, "context_budget_tokens", 0) or 0)
-        budget_chars = token_budget * 3 if token_budget > 0 else self.config.agent.context_budget_chars
+        # 以 max_tokens 为参考窗口：用量达到该比例即触发压缩，字符预算由 token 校准换算
+        ratio = float(getattr(self.config.agent, "context_budget_ratio", 0.8) or 0.8)
+        token_budget = max(1, int(self.config.agent.max_tokens or 0))
+        budget_chars = token_budget * 3
         context = ContextBuilder(
             self.runtime,
             budget_chars=budget_chars,
@@ -304,6 +306,7 @@ class Kernel:
             secrets=self.secrets,
             ui=self.ui,
             compact_budget=budget_chars,
+            compact_trigger_ratio=ratio,
             logs=self.logs,
             files_root=self.home / "sessions",
             env=env,
@@ -369,6 +372,9 @@ class Kernel:
             secrets=self.secrets,
             ui=self.ui,
             compact_budget=self.loop._compactor.budget_chars if self.loop._compactor else None,
+            compact_trigger_ratio=(
+                self.loop._compactor.trigger_ratio if self.loop._compactor else 0.0
+            ),
             logs=self.logs,
             files_root=self.home / "sessions",
             env=self.env,

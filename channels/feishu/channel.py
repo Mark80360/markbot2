@@ -103,6 +103,12 @@ def _ignore_event(_data) -> None:
     return None
 
 
+def _truthy(value: Any) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
 def register_ignored_events(builder):
     """给 lark 事件分发器注册空处理器；旧版 SDK 没有对应方法时跳过。"""
     for name in IGNORED_EVENTS:
@@ -167,7 +173,10 @@ def make_handler(gateway: Gateway, settings: Settings):
                 _json_response(self, 400, {"error": "invalid json"})
                 return
             ok = gateway.notify(
-                str(payload.get("chat_id") or ""), str(payload.get("text") or "")
+                str(payload.get("chat_id") or ""),
+                str(payload.get("text") or ""),
+                reply_to=str(payload.get("reply_to") or "") or None,
+                reply_in_thread=_truthy(payload.get("reply_in_thread")),
             )
             _json_response(self, 200 if ok else 400, {"ok": ok})
 

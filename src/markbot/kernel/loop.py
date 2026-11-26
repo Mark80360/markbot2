@@ -240,6 +240,7 @@ class AgentLoop:
         secrets: dict[str, str] | None = None,
         ui: UI | None = None,
         compact_budget: int | None = None,
+        compact_trigger_ratio: float = 0.8,
         logs: DailyLog | None = None,
         files_root: Path | None = None,
         env: ExecutionEnvironment | None = None,
@@ -275,7 +276,11 @@ class AgentLoop:
         )
         self._compactor = (
             # 压缩摘要可以交给更便宜的 fast 角色模型（ADR 0011）
-            Compactor(compact_provider or provider, budget_chars=compact_budget)
+            Compactor(
+                compact_provider or provider,
+                budget_chars=compact_budget,
+                trigger_ratio=compact_trigger_ratio or 0.8,
+            )
             if compact_budget and compact_budget > 0
             else None
         )
@@ -579,11 +584,16 @@ class AgentLoop:
         chars = estimate_chars(payload)
         budget = getattr(self._context, "budget_chars", 0) or 0
         _logger.debug("context usage session=%s chars=%d budget=%d", session.id, chars, budget)
+        trigger = (
+            int(budget * self._compactor.trigger_ratio)
+            if self._compactor is not None
+            else int(budget * 0.8)
+        )
         if budget and chars > budget * 0.95:
             self._log(
                 "WARN", "上下文超预算，强制压缩", session=session.id, chars=chars, budget=budget
             )
-        elif budget and chars > budget * 0.8:
+        elif trigger and chars > trigger:
             self._log(
                 "WARN", "上下文接近预算", session=session.id, chars=chars, budget=budget
             )

@@ -348,9 +348,13 @@ def test_parse_settings_defaults_and_proxy():
         {"tools": {"web": {"proxy": "http://p:1"}, "browser": {"confirm": "bogus", "blocked_domains": "Bad.com"}}}
     )
     assert settings.confirm == "risky"
+    assert settings.confirm_script is False
     assert settings.proxy == "http://p:1"
     assert settings.blocked_domains == ["bad.com"]
     assert settings.headless is True
+    assert browser.parse_settings(
+        {"tools": {"browser": {"confirm_script": "true"}}}
+    ).confirm_script is True
 
 
 def test_navigation_denial(public_dns):
