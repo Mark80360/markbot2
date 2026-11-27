@@ -111,6 +111,23 @@ def test_secret_env_loaded_from_toml(tmp_path):
     assert cfg.permissions.secret_env == {"CRAWL_TOKEN": ["curl"]}
 
 
+def test_secret_env_scalar_values_do_not_crash(tmp_path):
+    (tmp_path / "config.toml").write_text(
+        "[permissions.secret_env]\n"
+        "CRAWL4AI_API_TOKEN = true\n"
+        'CURL_TOKEN = "curl"\n'
+        "OFF_TOKEN = false\n",
+        encoding="utf-8",
+    )
+    cfg = load_config(home=tmp_path, project_root=tmp_path)
+    policy = PermissionPolicy(cfg.permissions, root=tmp_path)
+    assert policy.injectable_secrets() == ["CRAWL4AI_API_TOKEN", "CURL_TOKEN"]
+    # true = 不限程序；字符串 = 只允许该程序；false = 没登记
+    assert policy.check_secret_injection(["CRAWL4AI_API_TOKEN"], "python3 x.py").allowed
+    assert not policy.check_secret_injection(["CURL_TOKEN"], "python3 x.py").allowed
+    assert not policy.check_secret_injection(["OFF_TOKEN"], "curl x").allowed
+
+
 # ------------------------------------------------------------ 工具
 
 

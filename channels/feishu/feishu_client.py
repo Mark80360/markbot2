@@ -15,6 +15,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
@@ -184,9 +185,10 @@ class FeishuClient:
         reply_in_thread: bool = False,
     ) -> bool:
         """先发媒体，再按内容复杂度选择 text / post / 卡片发送；全部文本发送成功返回 True。"""
+        sent_media: list[str] = []
         if media:
             try:
-                self.send_media(
+                sent_media = self.send_media(
                     chat_id, media, reply_to=reply_to, reply_in_thread=reply_in_thread
                 )
             except RuntimeError as exc:
@@ -197,6 +199,12 @@ class FeishuClient:
             if not reply_in_thread:
                 reply_to = None
         text = (text or "").strip()
+        if sent_media:
+            # 已经作为图片/文件单独发出的本地路径不能再用字面量 Markdown 发一遍
+            stripped = strip_local_media_markdown(text, only=sent_media)
+            if stripped != text:
+                log(f"文本已剔除已发送的媒体引用 chat={chat_id} 数量={len(sent_media)}")
+            text = stripped
         if not text:
             return True
         ok = True
@@ -439,8 +447,9 @@ class FeishuClient:
         *,
         reply_to: str | None = None,
         reply_in_thread: bool = False,
-    ) -> None:
-        """按扩展名选择 image / audio / media / file 消息逐条发送。"""
+    ) -> list[str]:
+        """按扩展名选择 image / audio / media / file 消息逐条发送，返回发送成功的本地路径。"""
+        sent: list[str] = []
         first = True
         for raw in paths:
             path = Path(str(raw)).expanduser()
@@ -466,7 +475,7 @@ class FeishuClient:
                 continue
             target = reply_to if (first or reply_in_thread) else None
             try:
-                self._deliver(
+                ok = self._deliver(
                     chat_id,
                     msg_type,
                     json.dumps(content, ensure_ascii=False),
@@ -476,7 +485,11 @@ class FeishuClient:
             except RuntimeError as exc:
                 log(f"发送媒体消息失败 type={msg_type} path={path}: {exc}")
                 continue
+            if not ok:
+                continue
+            sent.append(str(path.resolve()))
             first = False
+        return sent
 
     # ---------------------------------------------------------------- 流式卡片
     def create_stream_card(
@@ -651,35 +664,92 @@ def _multipart_body(
 
 
 _LOCAL_MEDIA_RE = re.compile(r"!?\[[^\]]*\]\(([^)\s]+)\)")
+# 围栏代码块与行内代码：里面的 ![](路径) 只是示例，不能当真实媒体
+_CODE_SPAN_RE = re.compile(r"```[\s\S]*?```|`[^`\n]*`")
+
+
+def _resolve_local_media(raw: str) -> Path | None:
+    """把 Markdown 链接目标解析成本地文件；不是已存在的本地文件时返回 None。"""
+    raw = raw.strip().strip("<>")
+    if raw.startswith(("http://", "https://", "data:")):
+        return None
+    if raw.startswith("file://"):
+        raw = urllib.parse.unquote(raw[len("file://") :])
+    else:
+        raw = urllib.parse.unquote(raw)
+    candidates = [Path(raw).expanduser()]
+    if not candidates[0].is_absolute():
+        candidates = [
+            Path.cwd() / candidates[0],
+            markbot_home() / candidates[0],
+        ]
+    for path in candidates:
+        try:
+            if path.is_file():
+                return path.resolve()
+        except OSError:
+            continue
+    return None
+
+
+def _iter_local_media_refs(text: str):
+    """遍历文本里指向本地文件的 Markdown 引用，产出 (match, resolved_path)。"""
+    if not text:
+        return
+    code_spans = [(m.start(), m.end()) for m in _CODE_SPAN_RE.finditer(text)]
+    for match in _LOCAL_MEDIA_RE.finditer(text):
+        if any(start <= match.start() < end for start, end in code_spans):
+            continue
+        path = _resolve_local_media(match.group(1))
+        if path is not None:
+            yield match, path
 
 
 def _extract_local_media(text: str) -> list[str]:
     """从回复的 Markdown 图片/链接里提取已存在的本地文件，作为出站媒体。"""
     found: list[str] = []
-    for match in _LOCAL_MEDIA_RE.finditer(text or ""):
-        raw = match.group(1).strip().strip("<>")
-        if raw.startswith(("http://", "https://", "data:")):
-            continue
-        if raw.startswith("file://"):
-            raw = urllib.parse.unquote(raw[len("file://") :])
-        else:
-            raw = urllib.parse.unquote(raw)
-        candidates = [Path(raw).expanduser()]
-        if not candidates[0].is_absolute():
-            candidates = [
-                Path.cwd() / candidates[0],
-                markbot_home() / candidates[0],
-            ]
-        for path in candidates:
-            try:
-                if path.is_file():
-                    resolved = str(path.resolve())
-                    if resolved not in found:
-                        found.append(resolved)
-                    break
-            except OSError:
-                continue
+    for _match, path in _iter_local_media_refs(text):
+        resolved = str(path)
+        if resolved not in found:
+            found.append(resolved)
     return found
+
+
+def strip_local_media_markdown(
+    text: str, *, only: Iterable[str] | None = None
+) -> str:
+    """删除已作为飞书媒体单独发送的本地图片/文件 Markdown 引用。
+
+    只处理指向存在本地文件的引用，http(s)/data 图片与代码块内示例保持原样；
+    ``only`` 给定时只删这些路径（通常是发送成功的媒体），其余保留成文本回退。
+    独占一行的引用整行删除，行内引用只删引用本身。
+    """
+    if not text:
+        return text
+    keep = None if only is None else {str(Path(item).resolve()) for item in only}
+    targets = [
+        match
+        for match, path in _iter_local_media_refs(text)
+        if keep is None or str(path) in keep
+    ]
+    for match in reversed(targets):
+        start, end = match.start(), match.end()
+        line_start = text.rfind("\n", 0, start) + 1
+        line_end = text.find("\n", end)
+        if line_end == -1:
+            line_end = len(text)
+        before = text[line_start:start]
+        after = text[end:line_end]
+        if not before.strip() and not after.strip():
+            # 整行只有这一个媒体引用：连同换行一起删，并合并两侧空行
+            cut_end = line_end + 1 if line_end < len(text) else line_end
+            prefix, suffix = text[:line_start], text[cut_end:]
+            if prefix.endswith("\n") and suffix.startswith("\n"):
+                suffix = suffix[1:]
+            text = prefix + suffix
+        else:
+            text = text[:start] + text[end:]
+    return text
 
 
 def _transcription_endpoint(settings: Settings) -> str:

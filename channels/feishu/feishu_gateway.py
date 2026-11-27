@@ -51,6 +51,7 @@ from feishu_client import (
     _multipart_body,
     _safe_filename,
     _transcription_endpoint,
+    strip_local_media_markdown,
 )
 
 
@@ -129,6 +130,10 @@ class _StreamCard:
         self._last_edit = 0.0
         self._failed = False
 
+    def _render(self) -> str:
+        """卡片不接受本地图片路径（飞书要求 image_key），推送前先剔除媒体 Markdown。"""
+        return strip_local_media_markdown(self._text)
+
     def feed(self, delta: str) -> None:
         """收到一段增量文本：必要时创建卡片，并按节流更新内容。"""
         if self._failed:
@@ -137,6 +142,7 @@ class _StreamCard:
         if not self._text.strip() or len(self._text) > CARD_TEXT_LIMIT:
             # 超长内容交给普通发送分片，避免卡片体积超限
             return
+        content = self._render()
         now = time.monotonic()
         if self._card_id is None:
             card_id = self._client.create_stream_card(
@@ -146,18 +152,18 @@ class _StreamCard:
                 self._failed = True
                 return
             self._card_id = card_id
-            if self._client.update_stream_card(card_id, self._text, self._sequence):
+            if self._client.update_stream_card(card_id, content, self._sequence):
                 self._last_edit = now
-                self._pushed = self._text
+                self._pushed = content
             else:
                 self._failed = True
             return
         if now - self._last_edit < STREAM_EDIT_INTERVAL:
             return
         self._sequence += 1
-        if self._client.update_stream_card(self._card_id, self._text, self._sequence):
+        if self._client.update_stream_card(self._card_id, content, self._sequence):
             self._last_edit = now
-            self._pushed = self._text
+            self._pushed = content
         else:
             self._failed = True
 
@@ -165,7 +171,7 @@ class _StreamCard:
         """把卡片定稿为最终答复并关闭流式模式；返回是否已展示答复。"""
         if self._card_id is None or self._failed:
             return False
-        final = (text or "").strip() or self._text.strip()
+        final = (text or "").strip() or self._render().strip()
         if len(final) > CARD_TEXT_LIMIT:
             self._sequence += 1
             self._client.close_stream_card(self._card_id, self._sequence)
@@ -710,7 +716,12 @@ class Gateway:
         for path in _extract_local_media(answer):
             if path not in media:
                 media.append(path)
-        streamed = stream is not None and stream.finish(answer)
+        # 卡片定稿前先去掉本地图片/文件 Markdown：它们已作为媒体单独发送，
+        # 留在卡片里只会显示成用户看不懂的原始路径
+        card_text = strip_local_media_markdown(answer) if stream is not None else answer
+        if stream is not None and card_text != answer:
+            log(f"卡片内容已剔除本地媒体 Markdown chat={chat_id}")
+        streamed = stream is not None and stream.finish(card_text)
         self._reply(
             chat_id,
             "" if streamed else answer,

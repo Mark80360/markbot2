@@ -480,7 +480,11 @@ class PermissionPolicy:
 
 
 def _normalize_secret_env(raw: Any) -> dict[str, tuple[str, ...]]:
-    """``{NAME: [程序...]}``；也接受 ``[NAME, ...]`` 简写（等价于不限程序）。"""
+    """``{NAME: [程序...]}``；也接受 ``[NAME, ...]`` 简写（等价于不限程序）。
+
+    单个值还接受 ``NAME = "curl"`` 与 ``NAME = true``（不限程序）/ ``false``（不登记），
+    写错类型时不要让整个进程起不来。
+    """
     if isinstance(raw, (list, tuple, set)):
         raw = {str(name): ["*"] for name in raw}
     if not isinstance(raw, dict):
@@ -490,8 +494,14 @@ def _normalize_secret_env(raw: Any) -> dict[str, tuple[str, ...]]:
         key = str(name).strip()
         if not key:
             continue
+        if programs is False:
+            continue
+        if programs is True:
+            programs = ["*"]
         if isinstance(programs, str):
             programs = [programs]
+        elif not isinstance(programs, (list, tuple, set)):
+            programs = []
         names = tuple(
             "*" if str(p).strip() == "*" else PermissionPolicy._program_name(str(p).strip())
             for p in (programs or [])

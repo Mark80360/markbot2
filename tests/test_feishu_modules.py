@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib
+import json
 from pathlib import Path
 
 import pytest
@@ -239,4 +240,191 @@ def test_send_answer_keeps_thread_after_media(channel_path, tmp_path, monkeypatc
         "oc_1", "hello", media=["/tmp/a.png"], reply_to="om_1", reply_in_thread=False
     )
     assert calls == [("media", "om_1", False), ("text", None, False)]
+
+
+def test_strip_local_media_markdown_removes_standalone_line(channel_path, tmp_path):
+    """单独占一行的本地图片引用整行删除，不能留下原始 Markdown 路径。"""
+    client_module = importlib.import_module("feishu_client")
+    picture = tmp_path / "shot.png"
+    picture.write_bytes(b"png")
+    text = f"截图如下：\n\n![抖音首页截图]({picture})\n\n完成。"
+    out = client_module.strip_local_media_markdown(text)
+    assert out == "截图如下：\n\n完成。"
+    assert str(picture) not in out
+
+
+def test_strip_local_media_markdown_keeps_unrelated_refs(channel_path, tmp_path):
+    """远程图片、缺失文件、代码块与行内代码里的示例都不能误删。"""
+    client_module = importlib.import_module("feishu_client")
+    picture = tmp_path / "shot.png"
+    picture.write_bytes(b"png")
+    text = (
+        "![远程](https://example.com/a.png)\n"
+        "![缺失](/no/such/file.png)\n"
+        f"```markdown\n![图]({picture})\n```\n"
+        f"用 `![图]({picture})` 发图\n"
+        f"行内 ![图]({picture}) 引用"
+    )
+    out = client_module.strip_local_media_markdown(text)
+    assert "https://example.com/a.png" in out
+    assert "/no/such/file.png" in out
+    assert out.count("![图]") == 2  # 代码块与行内代码各保留一处
+    assert "行内  引用" in out  # 行外引用只删引用本身，保留上下文
+
+
+def test_strip_local_media_markdown_only_limits_to_given_paths(channel_path, tmp_path):
+    """only 只删除指定路径（发送成功的媒体），其余引用保留成文本回退。"""
+    client_module = importlib.import_module("feishu_client")
+    sent = tmp_path / "sent.png"
+    failed = tmp_path / "failed.png"
+    sent.write_bytes(b"png")
+    failed.write_bytes(b"png")
+    text = f"![已发送]({sent})\n![发送失败]({failed})"
+    out = client_module.strip_local_media_markdown(text, only=[str(sent)])
+    assert str(sent) not in out
+    assert str(failed) in out
+
+
+def test_extract_local_media_skips_code_fences(channel_path, tmp_path):
+    """代码块里的 ![](路径) 只是示例，不能当成真实媒体上传。"""
+    client_module = importlib.import_module("feishu_client")
+    picture = tmp_path / "shot.png"
+    picture.write_bytes(b"png")
+    assert client_module._extract_local_media(f"```\n![图]({picture})\n```") == []
+    assert client_module._extract_local_media(f"![图]({picture})") == [
+        str(picture.resolve())
+    ]
+
+
+def test_send_answer_strips_media_ref_after_successful_send(
+    channel_path, tmp_path, monkeypatch
+):
+    """媒体发送成功后，同一条文本里不能再出现本地路径 Markdown。"""
+    client_module = importlib.import_module("feishu_client")
+    client = client_module.FeishuClient(_settings(tmp_path))
+    picture = tmp_path / "qr.png"
+    picture.write_bytes(b"png")
+    delivered: list[tuple[str, str]] = []
+    monkeypatch.setattr(client, "send_media", lambda *a, **k: [str(picture.resolve())])
+    monkeypatch.setattr(
+        client,
+        "_deliver",
+        lambda chat_id, msg_type, content, reply_to, reply_in_thread: (
+            delivered.append((msg_type, content)),
+            True,
+        )[1],
+    )
+    client.send_answer(
+        "oc_1", f"二维码：\n![二维码]({picture})", media=[str(picture)]
+    )
+    assert delivered
+    assert all(str(picture) not in content for _msg_type, content in delivered)
+
+
+def test_send_answer_keeps_media_ref_when_send_failed(
+    channel_path, tmp_path, monkeypatch
+):
+    """媒体没发出去时保留 Markdown，至少用户还能看到原始路径。"""
+    client_module = importlib.import_module("feishu_client")
+    client = client_module.FeishuClient(_settings(tmp_path))
+    picture = tmp_path / "qr.png"
+    picture.write_bytes(b"png")
+    delivered: list[str] = []
+    monkeypatch.setattr(client, "send_media", lambda *a, **k: [])
+    monkeypatch.setattr(
+        client,
+        "_deliver",
+        lambda chat_id, msg_type, content, reply_to, reply_in_thread: (
+            delivered.append(content),
+            True,
+        )[1],
+    )
+    client.send_answer("oc_1", f"![二维码]({picture})", media=[str(picture)])
+    assert delivered and str(picture) in json.loads(delivered[-1])["text"]
+
+
+def test_process_stream_card_omits_local_media_markdown(
+    channel_path, tmp_path, monkeypatch
+):
+    """流式卡片定稿内容必须已经去掉本地图片 Markdown（图片单独发）。"""
+    gateway_module = importlib.import_module("feishu_gateway")
+    gateway = _gateway(tmp_path, monkeypatch)
+    picture = tmp_path / "shot.png"
+    picture.write_bytes(b"png")
+    answer = f"截图如下：\n\n![抖音首页截图]({picture})\n\n完成。"
+    finished: list[str] = []
+
+    class FakeStream:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def feed(self, _delta):
+            pass
+
+        def finish(self, text):
+            finished.append(text)
+            return True
+
+    monkeypatch.setattr(gateway_module, "_StreamCard", FakeStream)
+    monkeypatch.setattr(
+        gateway,
+        "_ask_markbot",
+        lambda *a, **k: {"text": answer},
+    )
+    replies: list[dict] = []
+    monkeypatch.setattr(
+        gateway,
+        "_reply",
+        lambda chat_id, text, **kwargs: replies.append(
+            {"chat_id": chat_id, "text": text, **kwargs}
+        ),
+    )
+
+    gateway.process(
+        {
+            "header": {"event_type": "im.message.receive_v1"},
+            "event": {
+                "message": {
+                    "chat_id": "oc_1",
+                    "chat_type": "p2p",
+                    "message_type": "text",
+                    "message_id": "om_1",
+                    "content": '{"text": "截图发我"}',
+                },
+                "sender": {"sender_id": {"open_id": "ou_1"}},
+            },
+        }
+    )
+
+    assert finished == ["截图如下：\n\n完成。"]
+    assert replies and str(picture) not in replies[-1]["text"]
+    assert replies[-1]["media"] == [str(picture.resolve())]
+
+
+def test_stream_card_feed_drops_local_media_markdown(channel_path, tmp_path):
+    """流式过程中的卡片更新也不能带本地图片路径，否则飞书报 200570 并中断流式。"""
+    gateway_module = importlib.import_module("feishu_gateway")
+    picture = tmp_path / "shot.png"
+    picture.write_bytes(b"png")
+    pushed: list[str] = []
+
+    class FakeClient:
+        def create_stream_card(self, *_args, **_kwargs):
+            return "card_1"
+
+        def update_stream_card(self, card_id, text, sequence):
+            pushed.append(text)
+            return True
+
+        def close_stream_card(self, card_id, sequence):
+            return True
+
+    stream = gateway_module._StreamCard(FakeClient(), "oc_1", "om_1", False)
+    stream.feed(f"截图如下：\n\n![抖音首页截图]({picture})\n\n完成。")
+
+    assert pushed and str(picture) not in pushed[0]
+    assert "完成。" in pushed[0]
+    # 没有最终文本时用累积内容兜底，同样不能带回原始路径
+    assert stream.finish("") is True
+    assert str(picture) not in pushed[-1]
 
