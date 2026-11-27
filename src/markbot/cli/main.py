@@ -218,6 +218,8 @@ DEFAULT_DIRS = (
 
 DEFAULT_CONFIG = """\
 # MarkBot 用户配置（由 `markbot init` 生成，可自由修改）
+# 初始化即最高权限：trusted 档位 + 不逐次确认 + 常用程序全部放行，
+# 尽量减少确认弹窗与命令限制。需要收紧时改 [permissions] 一节即可。
 [agent]
 provider = ""                  # openai_compat | anthropic | echo；留空按 model 推断
 model = "claude-sonnet-4-5"
@@ -234,15 +236,37 @@ context_budget_ratio = 0.8     # 用量达到 max_tokens 的 80% 时触发上下
 tool_result_max_chars = 16000  # 单条工具结果超限落盘，上下文只留预览与路径
 
 [permissions]
-profile = "standard"           # strict | standard | trusted
-confirm_on_write = true
-confirm_on_exec = true
+profile = "trusted"            # strict | standard | trusted（trusted = 最高权限，改这里收紧）
+confirm_on_write = false       # 写文件不再逐次确认
+confirm_on_exec = false        # 执行命令不再逐次确认
+trusted_exec = "all"           # trusted 档位下所有命令免确认（"listed" 则只有 allow_exec 内免确认）
 # 免逐次确认的命令：按程序名（allow_exec）或整条命令前缀（allow_commands，* 结尾）
-# allow_exec = ["curl", "git"]
+allow_exec = [
+  "curl", "git", "date", "tar", "zip", "unzip",                 # 网络 / 版本 / 时间 / 打包
+  "ls", "cat", "head", "tail", "wc", "grep", "sort", "uniq",    # 只读查看与统计
+  "cut", "file", "stat", "du", "df", "which", "pwd", "find", "echo", "touch", "cd",
+  "mkdir", "cp", "mv", "sed", "awk", "tr",                      # 目录/文本处理（sed -i、cp/mv 会改文件）
+  "python", "python3", "pip", "pip3", "node", "npm", "npx", "playwright",
+  "chmod", "ps", "pgrep", "kill", "pkill", "ss", "ip",
+]
 # allow_commands = ["curl -s http://127.0.0.1:11235/*"]
+# 需要访问工作区外目录时（默认只允许工作区与本会话临时目录）：
+# extra_writable_dirs = ["D:/data"]
+#
+# 无论档位如何，以下命令仍会确认一次：内联解释器（python -c、node -e）、
+# shell 与提权（sh/bash/sudo…）、命令替换（$()、反引号）、解码管道、危险 git 操作。
+#
+# 允许注入到命令环境变量的密钥（值放 secrets.toml），["*"] 表示不限程序：
+# [permissions.secret_env]
+# CRAWL4AI_API_TOKEN = ["*"]
 
 [packages]
-allow_project_packages = false # 允许加载 <project>/.markbot/ 下的包
+allow_project_packages = true  # 允许加载 <project>/.markbot/ 下的包
+
+# 浏览器与桌面控制：默认不确认（"none"），需要时改回 "risky" 或 "all"
+[tools.browser]
+confirm = "none"
+confirm_script = false
 
 # MCP server（需要安装可选依赖：pip install "markbot[mcp]"）
 # [tools.mcp_servers.filesystem]

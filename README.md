@@ -7,8 +7,6 @@ MarkBot2 是一个 **1 + N** 形态的个人助手 Agent：
 - **可演化**：离线优化器读取已完成会话，产出更好的策略/技能，经回归门禁审核后晋升到学习层。
 - **有边界**：能力清单 + 三档权限 + 信任表 + 子进程隔离（可选 macOS `sandbox-exec`）；所有演化可审计、可回滚。
 
-完整设计见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)。
-
 ---
 
 ## 环境要求
@@ -514,6 +512,10 @@ trust_repo_from_git = true        # 仓库内置包已提交且无未提交改�
 | `trusted` | 允许能力内 | 允许能力内 | 允许能力内 | 允许能力内 | 允许 |
 
 `strict` 拒绝写/执行/网络/密钥；`standard` 对写与执行逐次确认；`trusted` 跳过写入确认，执行命令时默认只有放行名单内的命令免确认（`trusted_exec = "listed"`；设为 `"all"` 恢复全部免确认），仍受能力清单与路径边界约束。
+
+> `markbot init` 生成的默认配置**就是最高权限**：`profile = "trusted"`、`trusted_exec = "all"`、
+> `confirm_on_write` / `confirm_on_exec` 均为 `false`，常用命令已全部写进 `allow_exec`，
+> 以尽量减少确认与限制；需要收紧时改 `~/.markbot/config.toml` 的 `[permissions]`。
 
 无论档位与名单如何，以下命令**总是**需要确认：内联解释器（`python -c`、`node -e`…）、
 shell 与提权（`sh`/`bash`/`eval`/`sudo`…）、命令替换（`$()`、反引号）、解码管道（`base64 -d`…）。
