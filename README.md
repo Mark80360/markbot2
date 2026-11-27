@@ -830,36 +830,22 @@ cli 依赖 kernel + optimizer
   获得受保护目录的内核级隔离。不可信代码仍建议放进容器或低权限用户运行。
 - 内部 HTTP（serve ↔ 渠道 ↔ 定时任务）用本机令牌鉴权，回调地址限制为回环地址（ADR 0004）。
 
-## 附录：Phase 3 第一批 —— 搜索与浏览器（ADR 0014）
+## 许可证
 
-- `web_search`：SearXNG / Tavily / Brave / Bing API / Bing 网页 / DuckDuckGo，`[tools.search] backend = "auto"` 自动回退。
-- `fetch_url` 默认输出正文 Markdown（保留标题、列表、绝对链接），支持 PDF 文本（`.[pdf]`），自动重试与缓存。
-- 内置浏览器（`.[browser]` + `playwright install chromium`，或 `[tools.browser] channel = "msedge"`）：
-  `browser_open/snapshot/click/type/...`，按元素编号操作，持久登录态，导航地址检查，
-  提交/付款/删除等操作需确认，`browser_handoff` 请用户接手验证码。执行脚本默认不确认，
-  需要时设 `[tools.browser] confirm_script = true`（`confirm = "all"` 时仍会确认）。
-- 新能力类型 `browser:<域名|*>`、`desktop:<应用|*>`；strict 档位禁止。
-- 详见 `docs/phase3-batch1-implementation-2026-11-23.md`。
+本项目以 [Apache License 2.0](LICENSE) 发布。
 
-## 附录：Phase 3 第二批 —— 看图、桌面控制、运维（ADR 0015）
+```
+Copyright 2026 MarkBot
 
-- 多模态：会话支持图片（飞书发来的图片、浏览器/桌面截图自动附给模型）；`[agent] vision = auto|true|false`，
-  `vision_max_images = 3` 控制每次请求最多附带的图片数；主模型不能看图时 `view_image` 交给 `[agent.roles.vision]` 描述。
-- 桌面控制（默认关闭，`[tools.desktop] enabled = true`，`.[desktop]`）：截图 → 坐标/控件编号点击、输入、按键，动作后自动截图；
-  每会话首个动作需确认，密码管理器等应用默认禁止操作。
-- 运维工具：`system_info`、`list_processes`、`disk_usage`、`check_port`、`service_status`、`kill_process`（默认无需确认，拒绝结束自身/父进程/系统关键进程，strict 档位禁止）；
-  安装 `.[sysops]`（psutil）后信息更完整。
-- 浏览器评测：`markbot eval --suite browser`（`evals/browser/` 5 个用例）。
-- 详见 `docs/phase3-batch2-implementation-2026-11-23.md`。
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
 
-## 附录：Phase 4 —— CI 与评测门禁（ADR 0016）
+    http://www.apache.org/licenses/LICENSE-2.0
 
-- CI：`.github/workflows/ci.yml`，Linux + Windows 双平台跑 ruff、全量测试、shell 冒烟测试（bash / pwsh）与 selftest；严格 lint 只报告。
-- 夜间评测：`.github/workflows/eval.yml`，编码 + 浏览器评测用真实模型跑，结果写入趋势文件，
-  掉分超过容忍度或低于 `evals/baselines.json` 时标红。需要配置仓库变量与密钥（见文件头注释）；模型网关在内网时用自托管运行机。
-- 本地：`markbot eval --suite coding --record --fail-on-regression`，`markbot eval --trend` 查看趋势
-  （`<home>/logs/optimizer.jsonl`）。
-- 优化器晋升门禁：`[optimizer] gate_suites = ["coding"]`（或 `markbot optimize --gate-suites coding,browser`），
-  候选在任一评测集上掉分即拒绝。
-- 修复：`markbot eval` 之前从空的临时 home 读配置，真实运行拿不到模型与密钥；现在读真实 home 的配置，学习层复制一份隔离。
-- 详见 `docs/phase4-implementation-2026-11-23.md`。
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+```
